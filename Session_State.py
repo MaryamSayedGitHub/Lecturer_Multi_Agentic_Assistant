@@ -1,13 +1,6 @@
-# TODO Phase 1: shared state, agent order, agent-selection logic
-
 from operator import add
-from typing import Annotated, TypedDict
+from typing import Annotated, Literal, TypedDict
 
-from graph_nodes.slides_agent import Slide
-from graph_nodes.code_agent import CodeExample
-from graph_nodes.quiz_agent import QuizQuestion
-
-from typing_extensions import Literal
 
 class SessionBrief(TypedDict):
     session_id: str
@@ -23,20 +16,21 @@ class SessionBrief(TypedDict):
     learning_objectives: list[str]
     notes: str
 
+
 class SessionState(TypedDict):
-    # 1) Input 
+    # 1) Input
     brief: SessionBrief
 
-    # 2) Orchestrator 
+    # 2) Orchestrator
     selected_agents: list[str]
     reasoning: str
     memory_context: list[str]
 
-    # 3) Agents 
+    # 3) Agents (each agent stores plain dicts, via model_dump())
     outline: list[str]
-    slides: list[Slide]
-    code_examples: list[CodeExample]
-    quiz: list[QuizQuestion]
+    slides: list[dict]
+    code_examples: list[dict]
+    quiz: list[dict]
 
     # 4) Draft + revision
     draft: dict
@@ -44,7 +38,7 @@ class SessionState(TypedDict):
     feedback: str
     revision_count: int
 
-    # 5) final output
+    # 5) Final output
     final_output: dict
     messages: Annotated[list[str], add]
 
@@ -52,17 +46,23 @@ class SessionState(TypedDict):
 AgentName = Literal["research_agent", "slides_agent", "code_agent", "quiz_agent"]
 AGENT_ORDER: list[AgentName] = ["research_agent", "slides_agent", "code_agent", "quiz_agent"]
 
-def next_agent(state, current) -> str:
 
+def next_agent(state, current: str) -> str:
+    """Return the next selected agent after `current`, or 'draft_agent' if none is left."""
     selected = state["selected_agents"]
 
-    if current in AGENT_ORDER:
-        current_index=AGENT_ORDER.index(current)
-        if current_index + 1 < len(AGENT_ORDER):
-            next_agent = AGENT_ORDER[current_index + 1]
-            if next_agent in selected:
-                return next_agent
-    elif current not in AGENT_ORDER:
-        next_agent = AGENT_ORDER[0]
-    else:
-        return "draft_agent"
+    # If current is not one of the 4 agents (e.g. "orchestrator"), start from the beginning.
+    start = AGENT_ORDER.index(current) + 1 if current in AGENT_ORDER else 0
+
+    for name in AGENT_ORDER[start:]:
+        if name in selected:
+            return name
+    return "draft_agent"
+
+
+if __name__ == "__main__":
+    s = {"selected_agents": ["research_agent", "quiz_agent"]}
+    assert next_agent(s, "orchestrator") == "research_agent"
+    assert next_agent(s, "research_agent") == "quiz_agent"   # slides + code skipped
+    assert next_agent(s, "quiz_agent") == "draft_agent"
+    print("next_agent: OK")

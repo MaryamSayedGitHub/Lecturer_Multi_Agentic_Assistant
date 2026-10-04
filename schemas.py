@@ -46,7 +46,10 @@ class CodeExample(BaseModel):
         description="Complete, runnable code. Self-contained: no input(), no files, no network."
     )
     explanation: str = Field(
-        description="Step-by-step explanation of what the code does and what it prints."
+        description=(
+            "Plain text, no markdown and no code fences. "
+            "At most 5 short sentences: what the code does, then what it prints."
+        )
     )
 
 

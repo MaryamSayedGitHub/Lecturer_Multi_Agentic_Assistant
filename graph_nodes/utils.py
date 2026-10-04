@@ -1,5 +1,12 @@
 """Small helpers shared by all agents, so the same formatting code is not repeated."""
 
+from llm.llm_provider import get_llm
+
+
+def build_chain(prompt, schema, temperature: float = 0.3, attempts: int = 3):
+    """prompt | llm with structured output, retried automatically if the model fails."""
+    llm = get_llm(temperature=temperature).with_structured_output(schema)
+    return (prompt | llm).with_retry(stop_after_attempt=attempts)
 
 def format_outline(outline: list[str] | None) -> str:
     """['A', 'B'] -> '- A\\n- B' (the prompts expect text, the state stores a list)."""
