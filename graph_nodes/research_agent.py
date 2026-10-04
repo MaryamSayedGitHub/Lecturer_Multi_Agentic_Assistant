@@ -1,24 +1,46 @@
-from graph_nodes.utils import format_optional
-from llm.llm_provider import get_llm
+from graph_nodes.utils import build_chain, format_optional
+from MCP_Servers.mcp_client import web_search
 from prompts import RESEARCH_PROMPT
 from schemas import OutlineOutput
 
+NO_SEARCH = "(web search was not available, use well-established knowledge)"
+MAX_SEARCH_CHARS = 6000  # keep the prompt small: search results can be very long
+
+
+def _search(brief: dict) -> str:
+    """Search the web through Tavily (MCP). If it fails, continue without it: never crash the graph."""
+    query = (
+        f"{brief['topic']} {brief.get('programming_language', '')} "
+        f"lecture outline for {brief['student_level']} students"
+    ).strip()
+
+    try:
+        text = web_search(query, max_results=5)
+    except Exception as e:  # the message is already cleaned (no API key) by mcp_client
+        print(f"[research_agent] web search failed, continuing without it: {str(e)[:300]}")
+        return NO_SEARCH
+
+    text = text.strip()
+    if not text:
+        print("[research_agent] web search returned nothing")
+        return NO_SEARCH
+
+    print(f"[research_agent] web search OK ({len(text)} characters)")
+    return text[:MAX_SEARCH_CHARS]
+
 
 def research_agent(state) -> dict:
-    """Reads: brief.   Writes: outline.
-
-    First version: no web search yet. Tavily comes in Phase 6 (MCP).
-    """
+    """Reads: brief.   Writes: outline."""
     brief = state["brief"]
 
-    chain = RESEARCH_PROMPT | get_llm(temperature=0.3).with_structured_output(OutlineOutput)
+    chain = build_chain(RESEARCH_PROMPT, OutlineOutput, temperature=0.3)
 
     result = chain.invoke({
         "topic": brief["topic"],
         "level": brief["student_level"],
         "duration": brief["duration_minutes"],
         "objectives": format_optional(brief.get("learning_objectives")),
-        "search_results": "(web search is not connected yet, use well-established knowledge)",
+        "search_results": _search(brief),
     })
 
     return {"outline": result.sections}
@@ -30,6 +52,7 @@ if __name__ == "__main__":
             "topic": "Python decorators",
             "student_level": "intermediate",
             "duration_minutes": 60,
+            "programming_language": "Python",
             "learning_objectives": ["Students can write their own decorators."],
         },
     }

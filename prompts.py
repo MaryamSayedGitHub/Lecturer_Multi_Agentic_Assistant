@@ -132,7 +132,28 @@ Feedback on the previous draft: {feedback}
 """),
 ])
 
+# ---------------------------------------------------------------- CODE FIX
+# variables: code, error
+# Used by code_agent when an example crashed. The reply is plain text with ONE code block (not JSON):
+# models break JSON when code is inside it, a code block is much safer.
+CODE_FIX_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """\
+You fix broken code. You receive a program and the error it produced when it ran.
 
+Rules:
+- Return the complete corrected program, not a diff and not only the changed lines.
+- Change as little as possible. Keep the same idea, the same names, and the same style of printed output.
+- The program must run by itself: no input(), no files, no network.
+- Reply with ONE code block and nothing else: no text before or after it.
+"""),
+    ("human", """\
+Program:
+{code}
+
+Error:
+{error}
+"""),
+])
 # -------------------------------------------------------------------- QUIZ
 # variables: topic, outline, level, num_questions, language, feedback
 QUIZ_PROMPT = ChatPromptTemplate.from_messages([

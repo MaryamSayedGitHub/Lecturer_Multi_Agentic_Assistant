@@ -1,5 +1,5 @@
 from graph_nodes.utils import format_optional, format_outline, warn_if_count_differs
-from llm.llm_provider import get_llm
+from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
 from prompts import QUIZ_PROMPT
 from schemas import QuizOutput
 
@@ -9,8 +9,7 @@ def quiz_agent(state) -> dict:
     brief = state["brief"]
 
     # Build the chain inside the function, not at import time: get_llm() needs .env to be loaded.
-    chain = QUIZ_PROMPT | get_llm(temperature=0.3).with_structured_output(QuizOutput)
-
+    chain = build_chain(QUIZ_PROMPT, QuizOutput, temperature=0.3)
     result = chain.invoke({
         "topic": brief["topic"],
         "outline": format_outline(state.get("outline")),

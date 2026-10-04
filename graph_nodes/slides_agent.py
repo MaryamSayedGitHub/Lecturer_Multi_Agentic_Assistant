@@ -1,4 +1,4 @@
-from graph_nodes.utils import format_optional, format_outline, warn_if_count_differs
+from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
 from llm.llm_provider import get_llm
 from prompts import SLIDES_PROMPT
 from schemas import SlidesOutput
@@ -13,9 +13,7 @@ def slides_agent(state) -> dict:
     # was: max(5, min(12, duration // 5))
     num_slides = max(5, min(8, brief["duration_minutes"] // 8))
 
-    chain = (
-        SLIDES_PROMPT | get_llm(temperature=0.3).with_structured_output(SlidesOutput)
-    ).with_retry(stop_after_attempt=3)
+    chain = build_chain(SLIDES_PROMPT, SlidesOutput, temperature=0.3)
     result = chain.invoke({
         "topic": brief["topic"],
         "outline": format_outline(state.get("outline")),

@@ -1,20 +1,73 @@
+import re
 
-from llm.llm_provider import get_llm
-from prompts import CODE_PROMPT
-from schemas import CodeOutput
 from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
+from llm.llm_provider import get_llm
+from MCP_Servers.mcp_client import run_python_code
+from prompts import CODE_FIX_PROMPT, CODE_PROMPT
+from schemas import CodeOutput
+
+MAX_FIX_ATTEMPTS = 2  # how many times we ask the model to repair a crashing example
+
+
+def _text(content) -> str:
+    """A model reply is usually a string, but some providers return a list of blocks."""
+    if isinstance(content, str):
+        return content
+    return "".join(b if isinstance(b, str) else b.get("text", "") for b in content)
+
+
+def _extract_code(reply: str) -> str:
+    """Take the code out of a ```python ... ``` block. If there is no block, use the whole reply."""
+    match = re.search(r"```(?:python|py)?[ \t]*\n(.*?)```", reply, re.DOTALL)
+    return (match.group(1) if match else reply).strip()
+
+
+def _fix_code(code: str, error: str) -> str:
+    chain = (CODE_FIX_PROMPT | get_llm(temperature=0)).with_retry(stop_after_attempt=3)
+    reply = chain.invoke({"code": code, "error": error})
+    return _extract_code(_text(reply.content))
+
+
+def verify_example(example: dict) -> dict:
+    """Run the example. If it crashes, ask the model to fix it (up to MAX_FIX_ATTEMPTS times).
+
+    Adds three keys to the example:
+      verified      True = ran fine | False = still broken after the fixes | None = could not check
+      fix_attempts  how many repairs were needed
+      output        what the program printed (empty if it never ran successfully)
+    """
+    title = example.get("title", "example")
+    code = example["code"]
+
+    for attempt in range(MAX_FIX_ATTEMPTS + 1):
+        try:
+            result = run_python_code(code)
+        except Exception as e:  # the MCP server itself failed: do not crash the whole graph
+            print(f"[code_agent] could not run '{title}': {type(e).__name__}: {str(e)[:200]}")
+            return {**example, "code": code, "verified": None, "fix_attempts": attempt, "output": ""}
+
+        if result["ok"]:
+            return {**example, "code": code, "verified": True,
+                    "fix_attempts": attempt, "output": result["stdout"].strip()}
+
+        error = result["stderr"].strip() or "Unknown error"
+        print(f"[code_agent] '{title}' failed (try {attempt + 1}): {error.splitlines()[-1]}")
+
+        if attempt < MAX_FIX_ATTEMPTS:
+            code = _fix_code(code, error)
+
+    return {**example, "code": code, "verified": False,
+            "fix_attempts": MAX_FIX_ATTEMPTS, "output": ""}
+
 
 def code_agent(state) -> dict:
-    """Reads: brief, outline, feedback.   Writes: code_examples.
-
-    First version: the code is NOT executed yet. The run-and-verify loop comes in Phase 6
-    (code_runner_server).
-    """
+    """Reads: brief, outline, feedback.   Writes: code_examples (each one verified by running it)."""
     brief = state["brief"]
+
     num_examples = max(2, min(3, brief["duration_minutes"] // 30))
 
     chain = build_chain(CODE_PROMPT, CodeOutput, temperature=0.2)
-  
+
     result = chain.invoke({
         "topic": brief["topic"],
         "outline": format_outline(state.get("outline")),
@@ -27,7 +80,15 @@ def code_agent(state) -> dict:
 
     warn_if_count_differs("code_agent", len(result.examples), num_examples)
 
-    return {"code_examples": [e.model_dump() for e in result.examples]}
+    examples = [e.model_dump() for e in result.examples]
+
+    # The runner executes Python only. For any other language we skip the check.
+    if brief["programming_language"].strip().lower() == "python":
+        examples = [verify_example(e) for e in examples]
+    else:
+        examples = [{**e, "verified": None, "fix_attempts": 0, "output": ""} for e in examples]
+
+    return {"code_examples": examples}
 
 
 if __name__ == "__main__":
@@ -47,6 +108,8 @@ if __name__ == "__main__":
     assert list(out.keys()) == ["code_examples"]
     assert len(out["code_examples"]) > 0
     for e in out["code_examples"]:
-        assert e["code"].strip() and e["explanation"].strip()
-        print("-", e["title"])
+        flag = {True: "verified", False: "STILL BROKEN", None: "not checked"}[e["verified"]]
+        print(f"- {e['title']}: {flag} (fixes: {e['fix_attempts']})")
+        if e["output"]:
+            print("    prints:", e["output"].splitlines()[0])
     print("code_agent: OK")
