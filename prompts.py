@@ -149,6 +149,8 @@ Rules:
 - Match the student level: {level}.
 - The explanation is 1 or 2 sentences and says why the correct option is right.
 - Apply the feedback below when it is not "None".
+- Make all four options similar in length and level of detail. The correct option must not be the longest or the most detailed one.
+- Keep options short. If a question is about code, put the code snippet in the question text and keep the options as short statements.
 - """ + _LANGUAGE_RULE + """
 """),
     ("human", """\
