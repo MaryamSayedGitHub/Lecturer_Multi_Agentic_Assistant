@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Generated files (keep the folder itself)
+outputs/*
+!outputs/.gitkeep
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/

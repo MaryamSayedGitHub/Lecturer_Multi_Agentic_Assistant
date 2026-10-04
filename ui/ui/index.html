@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lecturer Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Lecturer Assistant</span>
+    </div>
+    <a class="topbar-link" href="https://github.com/YOUR-USERNAME/lecturer-agentic-assistant">View on GitHub</a>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT: session brief -->
+    <section class="brief" aria-labelledby="brief-title">
+      <h1 id="brief-title">Prepare your next session</h1>
+      <p class="lede">Describe the session. You'll get slides, code examples and a quiz to review before anything is finalized.</p>
+
+      <form id="brief-form" novalidate>
+        <div class="field">
+          <label for="lecturer">Your name</label>
+          <input id="lecturer" name="lecturer_id" type="text" placeholder="Dr. Sara" autocomplete="name" required>
+          <p class="hint">Used to remember your preferences across sessions.</p>
+        </div>
+
+        <div class="field">
+          <label for="topic">Session topic</label>
+          <input id="topic" name="topic" type="text" placeholder="Python decorators" required>
+        </div>
+
+        <div class="field">
+          <label for="course">Course</label>
+          <input id="course" name="course_name" type="text" placeholder="Advanced Python">
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="level">Student level</label>
+            <select id="level" name="student_level">
+              <option value="beginner">Beginner</option>
+              <option value="intermediate" selected>Intermediate</option>
+              <option value="advanced">Advanced</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="duration">Duration (min)</label>
+            <input id="duration" name="duration_minutes" type="number" min="15" max="240" step="5" value="90">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="language">Teaching language</label>
+            <select id="language" name="language">
+              <option value="English">English</option>
+              <option value="Arabic">Arabic</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="proglang">Code language</label>
+            <select id="proglang" name="programming_language">
+              <option value="Python">Python</option>
+              <option value="JavaScript">JavaScript</option>
+              <option value="Java">Java</option>
+              <option value="C++">C++</option>
+            </select>
+          </div>
+        </div>
+
+        <fieldset class="field needs">
+          <legend>What should I prepare?</legend>
+          <label class="chip"><input type="checkbox" name="needs" value="slides" checked><span>Slides</span></label>
+          <label class="chip"><input type="checkbox" name="needs" value="code" checked><span>Code</span></label>
+          <label class="chip"><input type="checkbox" name="needs" value="quiz" checked><span>Quiz</span></label>
+        </fieldset>
+
+        <div class="field">
+          <label for="nq">Number of quiz questions</label>
+          <input id="nq" name="num_quiz_questions" type="number" min="3" max="20" value="8">
+        </div>
+
+        <div class="field">
+          <label for="objectives">Learning objectives</label>
+          <textarea id="objectives" name="learning_objectives" rows="3" placeholder="Students can explain what a decorator is and write their own."></textarea>
+        </div>
+
+        <div class="field">
+          <label for="notes">Anything else?</label>
+          <textarea id="notes" name="notes" rows="2" placeholder="Keep slides short. Add one hands-on exercise."></textarea>
+        </div>
+
+        <button type="submit" id="generate" class="btn primary">Generate session</button>
+      </form>
+    </section>
+
+    <!-- RIGHT: workspace -->
+    <section class="workspace" aria-live="polite">
+      <ol class="pipeline" id="pipeline" aria-label="Progress">
+        <li data-step="plan"><span>Plan</span></li>
+        <li data-step="research"><span>Research</span></li>
+        <li data-step="slides"><span>Slides</span></li>
+        <li data-step="code"><span>Code</span></li>
+        <li data-step="quiz"><span>Quiz</span></li>
+        <li data-step="draft"><span>Draft</span></li>
+        <li data-step="review"><span>Your review</span></li>
+        <li data-step="final"><span>Final files</span></li>
+      </ol>
+
+      <div id="empty" class="empty">
+        <h2>Nothing here yet</h2>
+        <p>Fill in the brief and choose <strong>Generate session</strong>. The draft will appear here for your review.</p>
+      </div>
+
+      <div id="error" class="error" role="alert" hidden></div>
+
+      <div id="result" hidden>
+        <div class="plan-note" id="plan-note"></div>
+
+        <div class="tabs" role="tablist" aria-label="Draft sections">
+          <button role="tab" id="tab-outline" aria-selected="true" aria-controls="panel-outline">Outline</button>
+          <button role="tab" id="tab-slides" aria-selected="false" aria-controls="panel-slides" tabindex="-1">Slides</button>
+          <button role="tab" id="tab-code" aria-selected="false" aria-controls="panel-code" tabindex="-1">Code</button>
+          <button role="tab" id="tab-quiz" aria-selected="false" aria-controls="panel-quiz" tabindex="-1">Quiz</button>
+        </div>
+
+        <div class="panel" id="panel-outline" role="tabpanel" aria-labelledby="tab-outline"></div>
+        <div class="panel" id="panel-slides" role="tabpanel" aria-labelledby="tab-slides" hidden></div>
+        <div class="panel" id="panel-code" role="tabpanel" aria-labelledby="tab-code" hidden></div>
+        <div class="panel" id="panel-quiz" role="tabpanel" aria-labelledby="tab-quiz" hidden></div>
+
+        <aside class="memory" id="memory" hidden>
+          <h3>What I remembered from your earlier sessions</h3>
+          <ul id="memory-list"></ul>
+        </aside>
+
+        <div class="review" id="review">
+          <label for="feedback">Changes you want (optional)</label>
+          <textarea id="feedback" rows="2" placeholder="Fewer words on each slide. Add a harder quiz question."></textarea>
+          <div class="review-actions">
+            <button type="button" id="revise" class="btn ghost">Request changes</button>
+            <button type="button" id="approve" class="btn primary">Approve and create files</button>
+          </div>
+        </div>
+
+        <div class="files" id="files" hidden>
+          <h3>Your files are ready</h3>
+          <ul id="files-list"></ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
