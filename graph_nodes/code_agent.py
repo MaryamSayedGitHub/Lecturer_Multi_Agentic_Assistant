@@ -1,3 +1,4 @@
+import logging
 import re
 
 from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
@@ -5,6 +6,8 @@ from llm.llm_provider import get_llm
 from MCP_Servers.mcp_client import run_python_code
 from prompts import CODE_FIX_PROMPT, CODE_PROMPT
 from schemas import CodeOutput
+
+log = logging.getLogger(__name__)
 
 MAX_FIX_ATTEMPTS = 2  # how many times we ask the model to repair a crashing example
 
@@ -43,7 +46,7 @@ def verify_example(example: dict) -> dict:
         try:
             result = run_python_code(code)
         except Exception as e:  # the MCP server itself failed: do not crash the whole graph
-            print(f"[code_agent] could not run '{title}': {type(e).__name__}: {str(e)[:200]}")
+            log.warning("could not run '%s': %s: %s", title, type(e).__name__, str(e)[:200])
             return {**example, "code": code, "verified": None, "fix_attempts": attempt, "output": ""}
 
         if result["ok"]:
@@ -51,7 +54,7 @@ def verify_example(example: dict) -> dict:
                     "fix_attempts": attempt, "output": result["stdout"].strip()}
 
         error = result["stderr"].strip() or "Unknown error"
-        print(f"[code_agent] '{title}' failed (try {attempt + 1}): {error.splitlines()[-1]}")
+        log.info("'%s' failed (try %d): %s", title, attempt + 1, error.splitlines()[-1])
 
         if attempt < MAX_FIX_ATTEMPTS:
             code = _fix_code(code, error)

@@ -1,1 +1,37 @@
-# TODO: Phase 7 (postgres service)
+# Start only the database (run the app yourself with `uv run python main.py`):
+#     docker compose up -d postgres
+# Start the database and the app together:
+#     docker compose up -d --build
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: lecturer_db
+    ports:
+      - "127.0.0.1:5432:5432"   # reachable from this machine only
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d lecturer_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://user:password@postgres:5432/lecturer_db
+      HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./outputs:/app/outputs
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

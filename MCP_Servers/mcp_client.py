@@ -1,8 +1,8 @@
 """
 MCP client: the bridge between our graph and the MCP servers.
 
-It knows two servers: code_runner (our own, stdio) and Tavily (hosted by Tavily, streamable HTTP).
-pptx_server is added the same way later: one more entry in `_server_config()`.
+It knows three servers: code_runner and pptx (our own, stdio) and Tavily (hosted by Tavily,
+streamable HTTP).
 
 The graph nodes are normal (sync) functions, but MCP is async. `run_python_code()` hides that,
 so code_agent can simply call it like a normal function.
@@ -33,6 +33,11 @@ def _server_config() -> dict:
             # sys.executable = the python of the current virtual environment
             "command": sys.executable,
             "args": [str(BASE_DIR / "MCP_Servers" / "code_runner_server.py")],
+        },
+        "pptx": {
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [str(BASE_DIR / "MCP_Servers" / "pptx_server.py")],
         },
     }
     if TAVILY_API_KEY:
@@ -105,6 +110,22 @@ def run_python_code(code: str) -> dict:
     """
     text = run_async(_call_tool("code_runner", lambda name: name == "run_python", {"code": code}))
     return json.loads(text)
+
+
+def create_presentation(relative_path: str, deck: dict) -> str:
+    """Create a .pptx inside outputs/ through the pptx server. Returns the file path.
+
+    Raises RuntimeError if the server reports a problem.
+    """
+    text = run_async(_call_tool(
+        "pptx",
+        lambda name: name == "create_presentation",
+        {"relative_path": relative_path, "deck": deck},
+    ))
+    result = json.loads(text)
+    if not result["ok"]:
+        raise RuntimeError(result["error"])
+    return result["path"]
 
 
 def web_search(query: str, max_results: int = 5) -> str:

@@ -1,4 +1,3 @@
-from graph_nodes.utils import format_optional, format_outline, warn_if_count_differs
 from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
 from prompts import QUIZ_PROMPT
 from schemas import QuizOutput

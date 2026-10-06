@@ -1,5 +1,4 @@
 from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
-from llm.llm_provider import get_llm
 from prompts import SLIDES_PROMPT
 from schemas import SlidesOutput
 
@@ -20,6 +19,7 @@ def slides_agent(state) -> dict:
         "level": brief["student_level"],
         "num_slides": num_slides,
         "language": brief["language"],
+        "notes": format_optional(brief.get("notes")),
         "memory_context": format_optional(state.get("memory_context")),
         "feedback": format_optional(state.get("feedback")),
     })

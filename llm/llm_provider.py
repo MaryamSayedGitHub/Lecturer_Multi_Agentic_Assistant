@@ -1,5 +1,3 @@
-# TODO Phase 2: get_llm() factory
-
 import os
 import sys
 

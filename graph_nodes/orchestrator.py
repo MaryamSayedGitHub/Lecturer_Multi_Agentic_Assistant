@@ -1,9 +1,13 @@
+import logging
+
 from pydantic import BaseModel, Field
 
-from graph_nodes.utils import format_optional
+from db.long_term_store import current_store, load_memory
 from graph_nodes.utils import build_chain, format_optional
 from prompts import ORCHESTRATOR_PROMPT
 from Session_State import AGENT_ORDER, AgentName
+
+log = logging.getLogger(__name__)
 
 # Maps what the lecturer ticks in the form ("needs") to an agent name.
 NEEDS_TO_AGENT = {
@@ -34,8 +38,13 @@ def normalize(agents: list[str]) -> list[str]:
 
 
 def orchestrator(state) -> dict:
-    """Reads: brief, memory_context, feedback.   Writes: selected_agents, reasoning."""
+    """Reads: brief, feedback, long-term memory.   Writes: selected_agents, reasoning, memory_context."""
     brief = state["brief"]
+
+    # Long-term memory is read once per session (the first time the orchestrator runs).
+    memory_context = state.get("memory_context") or load_memory(
+        current_store(), brief.get("lecturer_id", "")
+    )
 
     chain = build_chain(ORCHESTRATOR_PROMPT, RoutingDecision, temperature=0)
 
@@ -44,20 +53,21 @@ def orchestrator(state) -> dict:
             "topic": brief["topic"],
             "needs": ", ".join(brief["needs"]),
             "notes": format_optional(brief.get("notes")),
-            "memory_context": format_optional(state.get("memory_context")),
+            "memory_context": format_optional(memory_context),
             "feedback": format_optional(state.get("feedback")),
             "language": brief["language"],
         })
         selected = normalize(result.selected_agents)
         reasoning = result.reasoning
     except Exception as e:
-        # Print the real reason, otherwise a wrong API key looks the same as a bad JSON.
-        print(f"[orchestrator] LLM decision failed, using rules. {type(e).__name__}: {str(e)[:300]}")
+        # Log the real reason, otherwise a wrong API key looks the same as a bad JSON.
+        log.warning("LLM decision failed, using rules. %s: %s", type(e).__name__, str(e)[:300])
         selected = rule_based_agents(brief["needs"])
         reasoning = "Plan built from the requested outputs."
 
     return {
         "selected_agents": selected,
         "reasoning": reasoning,
+        "memory_context": memory_context,
         "messages": [f"orchestrator: {', '.join(selected)}"],
     }

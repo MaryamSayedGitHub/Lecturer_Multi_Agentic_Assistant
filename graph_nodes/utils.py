@@ -1,5 +1,7 @@
 """Small helpers shared by all agents, so the same formatting code is not repeated."""
 
+import logging
+
 from llm.llm_provider import get_llm
 
 
@@ -32,4 +34,4 @@ def format_optional(value) -> str:
 def warn_if_count_differs(name: str, got: int, expected: int) -> None:
     """Models sometimes miss the requested count by one or two. Warn, do not crash."""
     if got != expected:
-        print(f"[{name}] warning: expected {expected} items, got {got}")
+        logging.getLogger(name).warning("expected %d items, got %d", expected, got)

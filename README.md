@@ -4,18 +4,16 @@ A multi-agent assistant that helps lecturers prepare a full teaching session: **
 
 ---
 
-## Live demo
+## Status
 
-<!-- TODO: replace the link below with your deployed URL when the project is done. -->
-
-**Try it here: [https://YOUR-LIVE-LINK-HERE](https://YOUR-LIVE-LINK-HERE)**
-
-> The link above is a placeholder. Until it is replaced, follow [Setup](#setup) to run the project locally.
-
-<!-- TODO: add a screenshot at docs/ui-preview.png -->
-![UI preview](docs/ui-preview.png)
-
----
+| Part | State |
+| --- | --- |
+| Orchestrator, research, slides, code, quiz, draft agents | Working |
+| Human approval pause, revise loop (limited), final files | Implemented |
+| FastAPI endpoints, UI connected to the API | Implemented |
+| Postgres short-term and long-term memory | Implemented (falls back to in-memory without `DATABASE_URL`) |
+| LangSmith tracing and `evals/` | Implemented |
+| Deployed live demo | Not yet |
 
 ## What it does
 
@@ -111,6 +109,9 @@ Tracing and evaluation use **LangSmith**.
 | --- | --- |
 | `POST /api/session` | Submit a session brief and run the graph up to the human-approval checkpoint |
 | `POST /api/session/approve` | Approve the draft, or request changes with feedback, and resume the graph |
+| `GET /api/session/{id}` | Current status, draft and files of a session |
+| `GET /api/session/{id}/files/{name}` | Download one generated file |
+| `GET /api/health` | Health check |
 
 Example request:
 
@@ -137,14 +138,15 @@ curl -X POST http://localhost:8000/api/session \
 After `draft_agent` produces a draft, the graph pauses at `human_approval` instead of finalizing. The lecturer can:
 
 - **Approve**: call `POST /api/session/approve` with `"decision": "approve"` and the `session_id`. `final_agent` then creates the files.
-- **Request changes**: call the same endpoint with `"decision": "revise"` and a `feedback` message. The graph returns to the orchestrator with that feedback, up to a limited number of attempts.
+- **Request changes**: call the same endpoint with `"decision": "revise"` and a `feedback` message. The graph returns to the orchestrator with that feedback. `MAX_REVISIONS` (default 3) limits how many times this can happen; after that the API answers `409`.
 
 ## Project structure
 
 ```
 .
 ├── graph_nodes/            # Agents: orchestrator, research, slides, code, quiz, draft, human_approval, final
-├── MCP_Servers/            # Custom MCP servers (pptx, code runner) and the MCP client
+│   └── export.py           # Writes the code file and quiz files (plain functions)
+├── MCP_Servers/            # Custom MCP servers (pptx, code runner), pptx_builder, and the MCP client
 ├── Session_State.py        # Shared graph state, agent order, agent-selection logic
 ├── graph.py                # Graph construction and compilation
 ├── GraphController.py      # Wraps the graph: start, approve, get state
@@ -152,14 +154,15 @@ After `draft_agent` produces a draft, the graph pauses at `human_approval` inste
 ├── main.py                 # Application entrypoint
 ├── app/                    # FastAPI app setup
 ├── routes/                 # API routes
-├── config/                 # Settings (pydantic-settings) and LangSmith tracing setup
+├── config/                 # Settings (read from .env) and LangSmith tracing setup
 ├── db/                     # Checkpointer (short-term) and Store (long-term)
 ├── llm/                    # LLM provider factory (Groq / Gemini)
 ├── templates/              # PowerPoint template and output templates
 ├── ui/                     # Frontend (index.html, style.css, script.js)
-├── evals/                  # LangSmith dataset and evaluators
+├── evals/                  # Sample briefs and evaluators (local or LangSmith)
+├── tests/                  # Offline tests (no API key or database needed)
 ├── outputs/                # Generated files
-├── docker-compose.yml      # PostgreSQL service
+├── docker-compose.yml      # PostgreSQL service + the app
 ├── Dockerfile
 ├── pyproject.toml
 └── .env.example
@@ -180,8 +183,8 @@ After `draft_agent` produces a draft, the graph pauses at `human_approval` inste
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/lecturer-agentic-assistant.git
-cd lecturer-agentic-assistant
+git clone https://github.com/MaryamSayedGitHub/Lecturer_Multi_Agentic_Assistant.git
+cd Lecturer_Multi_Agentic_Assistant
 
 uv sync
 ```
@@ -202,7 +205,9 @@ cp .env.example .env
 | `GOOGLE_API_KEY` | Gemini API key |
 | `GEMINI_MODEL` | Gemini model name |
 | `TAVILY_API_KEY` | Tavily API key |
-| `DATABASE_URL` | PostgreSQL connection string |
+| `DATABASE_URL` | PostgreSQL connection string. Leave empty to run without a database (memory is lost on restart) |
+| `MAX_REVISIONS` | How many times a draft can be sent back (default 3) |
+| `HOST`, `PORT`, `LOG_LEVEL` | Server settings (default `127.0.0.1`, `8000`, `INFO`) |
 | `LANGSMITH_TRACING` | `true` to enable tracing |
 | `LANGSMITH_API_KEY` | LangSmith API key |
 | `LANGSMITH_PROJECT` | LangSmith project name |
@@ -214,7 +219,7 @@ Model names change over time. Check each provider's current model list before fi
 1. Start the database:
 
    ```bash
-   docker compose up -d
+   docker compose up -d postgres
    ```
 
 2. In another terminal, start the app:
@@ -225,28 +230,44 @@ Model names change over time. Check each provider's current model list before fi
 
 3. Open [http://localhost:8000](http://localhost:8000).
 
+To run the database and the app together in Docker instead: `docker compose up -d --build`.
+
+To preview the UI with fake data and no backend, open `ui/index.html` directly, or add `?demo=1` to the address.
+
+### Tests
+
+```bash
+uv run python -m unittest discover -s tests -v   # offline: no keys, no database
+uv run python test_code_runner.py                # the code runner MCP server
+uv run python test_llm.py                        # needs an LLM key
+uv run python run_graph.py                       # whole graph from a script, needs an LLM key
+```
+
 ### Running the evaluations
 
 ```bash
-uv run python evals/run_eval.py
+uv run python evals/run_eval.py              # prints a pass/fail table
+uv run python evals/run_eval.py --langsmith  # also uploads the experiment to LangSmith
 ```
 
-Results appear in your LangSmith project.
+Both make real LLM calls for every brief in `evals/dataset.json`.
 
 ## Known limitations
 
 - **Free-tier rate limits**: Groq, Gemini, and Tavily free tiers limit requests per minute and per month. A full session makes several LLM calls, so heavy testing can hit these limits.
-- **Text-only slides**: slides contain titles, bullets, and speaker notes. Images and diagrams are not generated.
+- **Slide visuals**: the deck has a designed layout, flow diagrams drawn from shapes, code slides and question/answer slides. It does not contain photos or AI-generated images. At most 3 quiz questions are placed in the deck; the full quiz is in `quiz.md`.
 - **Code verification**: `code_runner_server` runs code with a timeout. It is meant for local development and should be sandboxed further before any public deployment.
+- **No login**: a lecturer is identified only by the name typed in the form, so anyone who types the same name shares that memory. Add authentication before any shared deployment.
 - **Model quality**: smaller or local models may produce malformed structured output. The agents retry, but results vary by model.
 
 ## Roadmap
 
 - [ ] Run slides, code, and quiz agents in parallel
 - [ ] Export the quiz to common LMS formats
-- [ ] Add images and diagrams to slides
+- [x] Diagrams, code slides and question slides in the deck
+- [ ] Photos or generated images in slides
 - [ ] Support uploading existing course material as context
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0 is intended. The `LICENSE` file has not been added to the repository yet.

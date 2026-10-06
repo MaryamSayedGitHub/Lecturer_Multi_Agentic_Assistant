@@ -1,4 +1,3 @@
-# TODO Phase 2: all system prompts
 """
 All agent prompts in one file. Every prompt answers 4 questions:
   1) Role  2) Input  3) Output format  4) Rules
@@ -81,7 +80,7 @@ Search results:
 
 
 # ------------------------------------------------------------------ SLIDES
-# variables: topic, outline, level, num_slides, language, memory_context, feedback
+# variables: topic, outline, level, num_slides, language, notes, memory_context, feedback
 SLIDES_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """\
 You are an expert at turning a lecture outline into clear presentation slides.
@@ -93,7 +92,9 @@ Rules:
 - Put the longer explanation in the speaker notes (2 to 4 sentences per slide).
 - Match the student level: {level}.
 - Do not put code blocks on slides. Code examples are produced separately. Short inline code names are fine.
-- Respect the lecturer's preferences and feedback below when they are not "None".
+- Make the slides visual: give about half of them a diagram (diagram_steps) that shows a process, a sequence of events, or how one thing leads to another. The diagram must add to the bullets, not repeat them word for word. The first and the last slide have no diagram.
+- Write bullets that say something concrete: a fact, an example, or a consequence. Avoid vague bullets such as "Introduction to the topic".
+- Respect the lecturer's notes, preferences and feedback below when they are not "None".
 - """ + _LANGUAGE_RULE + """
 """),
     ("human", """\
@@ -101,6 +102,7 @@ Topic: {topic}
 Outline:
 {outline}
 
+Lecturer notes: {notes}
 Lecturer preferences from memory: {memory_context}
 Feedback on the previous draft: {feedback}
 """),

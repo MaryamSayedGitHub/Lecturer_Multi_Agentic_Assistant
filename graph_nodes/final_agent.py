@@ -1,9 +1,64 @@
-def final_agent(state) -> dict:
-    """TEMPORARY (Phase 5): just copies the draft.
+import logging
 
-    Later: create the .pptx / code file / quiz file (Phase 6) and save long-term memory (Phase 9).
+from config.settings import OUTPUT_DIR
+from db.long_term_store import current_store, save_session
+from graph_nodes.export import slugify, write_code_file, write_quiz_files
+
+log = logging.getLogger(__name__)
+
+
+def _create_pptx(relative_path: str, draft: dict, lecturer: str) -> None:
+    """Through the pptx MCP server. If the server cannot start, build the file directly:
+    the lecturer already approved the draft, so a tool problem must not lose the slides."""
+    deck = {
+        "title": draft["topic"],
+        "course_name": draft.get("course_name", ""),
+        "lecturer": lecturer,
+        "slides": draft["slides"],
+        "code_examples": draft.get("code_examples", []),
+        "quiz": draft.get("quiz", []),
+    }
+    try:
+        from MCP_Servers.mcp_client import create_presentation
+
+        create_presentation(relative_path, deck)
+    except Exception as e:
+        log.warning("pptx MCP server failed, building directly. %s: %s", type(e).__name__, str(e)[:200])
+        from MCP_Servers.pptx_builder import build_presentation
+
+        build_presentation(OUTPUT_DIR / relative_path, deck)
+
+
+def final_agent(state) -> dict:
+    """Reads: brief, draft, feedback_history.   Writes: final_output.
+
+    Runs only after the lecturer approved. Creates the files in outputs/<session_id>/ and
+    saves what was learned about the lecturer to long-term memory. No LLM is used here.
     """
+    brief = state["brief"]
+    draft = state["draft"]
+    session_id = slugify(brief["session_id"])
+    folder = OUTPUT_DIR / session_id
+    folder.mkdir(parents=True, exist_ok=True)
+
+    files: list[str] = []
+
+    if draft.get("slides"):
+        name = f"{slugify(draft['topic'], 'slides')}.pptx"
+        _create_pptx(f"{session_id}/{name}", draft, brief.get("lecturer_id", ""))
+        files.append(name)
+
+    if draft.get("code_examples"):
+        files.append(write_code_file(folder, draft["code_examples"], brief["programming_language"]).name)
+
+    if draft.get("quiz"):
+        files += [p.name for p in write_quiz_files(folder, draft["quiz"], draft["topic"])]
+
+    memory_saved = save_session(
+        current_store(), brief, draft.get("outline", []), state.get("feedback_history", [])
+    )
+
     return {
-        "final_output": {"draft": state["draft"]},
-        "messages": ["final_agent: done"],
+        "final_output": {"folder": session_id, "files": files, "memory_saved": memory_saved},
+        "messages": [f"final_agent: created {len(files)} file(s)"],
     }

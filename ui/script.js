@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------
-// Set DEMO_MODE = false once the FastAPI backend is running.
-// In demo mode the page uses fake data so you can preview the UI.
+// DEMO_MODE = true shows fake data without a backend (open index.html directly,
+// or add ?demo=1 to the address). Served by FastAPI, the page calls the real API.
 // ---------------------------------------------------------------
-const DEMO_MODE = true;
+const DEMO_MODE = location.protocol === "file:" || new URLSearchParams(location.search).has("demo");
 const API_BASE = "";   // same origin as the FastAPI app
 
 const $ = (id) => document.getElementById(id);
@@ -52,6 +52,12 @@ function showTab(name) {
 tabs.forEach((t) => $(`tab-${t}`).addEventListener("click", () => showTab(t)));
 
 /* ---------- renderers ---------- */
+function verifiedLabel(verified) {
+  if (verified === true) return "Checked: this example ran without errors.";
+  if (verified === false) return "Warning: this example still failed when it was run. Review it before use.";
+  return "Not run automatically (only Python examples are checked).";
+}
+
 function renderDraft(data) {
   const d = data.draft;
 
@@ -70,6 +76,7 @@ function renderDraft(data) {
       el("article", { class: "slide" }, [
         el("h3", { text: s.title }),
         el("ul", {}, (s.bullets || []).map((b) => el("li", { text: b }))),
+        (s.diagram_steps || []).length ? el("p", { class: "notes", text: "Diagram: " + s.diagram_steps.join("  →  ") }) : null,
         s.notes ? el("p", { class: "notes", text: "Speaker notes: " + s.notes }) : null,
       ])
     ))
@@ -83,6 +90,7 @@ function renderDraft(data) {
         el("h3", { text: c.title }),
         el("pre", {}, [el("code", { text: c.code })]),
         el("p", { text: c.explanation }),
+        el("p", { class: "notes", text: verifiedLabel(c.verified) }),
       ])
     ))
   );
@@ -106,6 +114,13 @@ function renderDraft(data) {
   const mem = data.memory || [];
   $("memory").hidden = mem.length === 0;
   $("memory-list").replaceChildren(...mem.map((m) => el("li", { text: m })));
+
+  // the lecturer can only send a draft back a limited number of times
+  const left = data.revisions_left;
+  $("revise").hidden = left === 0;
+  $("feedback").placeholder = left === 0
+    ? "No more change requests left for this session."
+    : "Fewer words on each slide. Add a harder quiz question.";
 }
 
 function showError(msg) {
@@ -121,7 +136,15 @@ async function post(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`Server returned ${res.status}. Check that the backend is running.`);
+  if (!res.ok) {
+    // FastAPI puts the reason in "detail": a string, or a list of validation problems.
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = Array.isArray(body.detail) ? body.detail.map((d) => d.msg).join(". ") : body.detail;
+    } catch (_) { /* the reply was not JSON */ }
+    throw new Error(detail || `Server returned ${res.status}. Check that the backend is running.`);
+  }
   return res.json();
 }
 
@@ -182,6 +205,7 @@ $("brief-form").addEventListener("submit", async (e) => {
 async function sendDecision(decision) {
   showError("");
   const payload = { session_id: sessionId, decision, feedback: $("feedback").value.trim() };
+  if (decision === "revise" && !payload.feedback) return showError("Describe the changes you want first.");
   $("approve").disabled = $("revise").disabled = true;
   try {
     if (decision === "approve") {
@@ -190,7 +214,7 @@ async function sendDecision(decision) {
       document.querySelectorAll("#pipeline li").forEach((li) => (li.className = "done"));
       $("files-list").replaceChildren(
         ...data.files.map((f) =>
-          el("li", {}, [el("a", { href: f.url, text: f.name })])
+          el("li", {}, [el("a", { href: f.url, text: f.name, download: f.name })])
         )
       );
       $("review").hidden = true;
@@ -221,6 +245,7 @@ async function demoStart(brief) {
     selected_agents: ["research_agent", "slides_agent", "code_agent", "quiz_agent"]
       .filter((a) => brief.needs.includes(a.replace("_agent", "")) || a === "research_agent"),
     reasoning: `You asked for ${brief.needs.join(", ")}. Research runs first so the other parts share one outline.`,
+    revisions_left: 3,
     memory: ["Prefers short slides (5 bullets max).", "Teaches in English, code in Python."],
     draft: {
       outline: ["What a function is, as an object", "Closures", "Writing a decorator", "Decorators with arguments", "Hands-on exercise"],
@@ -232,7 +257,8 @@ async function demoStart(brief) {
         {
           title: "A timing decorator",
           code: "import time\n\ndef timer(fn):\n    def wrapper(*args, **kwargs):\n        start = time.perf_counter()\n        result = fn(*args, **kwargs)\n        print(f'{fn.__name__} took {time.perf_counter() - start:.4f}s')\n        return result\n    return wrapper\n\n@timer\ndef work():\n    sum(range(1_000_000))\n\nwork()",
-          explanation: "Verified: runs without errors. Prints the elapsed time of work().",
+          explanation: "Prints the elapsed time of work().",
+          verified: true,
         },
       ],
       quiz: [

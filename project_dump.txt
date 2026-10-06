@@ -1,0 +1,3005 @@
+﻿
+===== app\app.py =====
+
+# TODO Phase 11: create FastAPI app, mount routes + ui
+
+===== app\__init__.py =====
+
+
+
+===== config\settings.py =====
+
+# TODO Phase 0: pydantic-settings reading .env
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")   
+
+OUTPUT_DIR = BASE_DIR / "outputs"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# LLM
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+===== config\tracing.py =====
+
+# TODO Phase 10: LangSmith setup
+
+===== config\__init__.py =====
+
+
+
+===== db\checkpointer.py =====
+
+# TODO Phase 7: SHORT-TERM memory (Postgres checkpointer)
+
+===== db\long_term_store.py =====
+
+# TODO Phase 9: LONG-TERM memory (LangGraph Store)
+
+===== db\__init__.py =====
+
+
+
+===== evals\run_eval.py =====
+
+# TODO Phase 10: LangSmith evaluation
+
+===== graph_nodes\code_agent.py =====
+
+import re
+
+from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
+from llm.llm_provider import get_llm
+from MCP_Servers.mcp_client import run_python_code
+from prompts import CODE_FIX_PROMPT, CODE_PROMPT
+from schemas import CodeOutput
+
+MAX_FIX_ATTEMPTS = 2  # how many times we ask the model to repair a crashing example
+
+
+def _text(content) -> str:
+    """A model reply is usually a string, but some providers return a list of blocks."""
+    if isinstance(content, str):
+        return content
+    return "".join(b if isinstance(b, str) else b.get("text", "") for b in content)
+
+
+def _extract_code(reply: str) -> str:
+    """Take the code out of a ```python ... ``` block. If there is no block, use the whole reply."""
+    match = re.search(r"```(?:python|py)?[ \t]*\n(.*?)```", reply, re.DOTALL)
+    return (match.group(1) if match else reply).strip()
+
+
+def _fix_code(code: str, error: str) -> str:
+    chain = (CODE_FIX_PROMPT | get_llm(temperature=0)).with_retry(stop_after_attempt=3)
+    reply = chain.invoke({"code": code, "error": error})
+    return _extract_code(_text(reply.content))
+
+
+def verify_example(example: dict) -> dict:
+    """Run the example. If it crashes, ask the model to fix it (up to MAX_FIX_ATTEMPTS times).
+
+    Adds three keys to the example:
+      verified      True = ran fine | False = still broken after the fixes | None = could not check
+      fix_attempts  how many repairs were needed
+      output        what the program printed (empty if it never ran successfully)
+    """
+    title = example.get("title", "example")
+    code = example["code"]
+
+    for attempt in range(MAX_FIX_ATTEMPTS + 1):
+        try:
+            result = run_python_code(code)
+        except Exception as e:  # the MCP server itself failed: do not crash the whole graph
+            print(f"[code_agent] could not run '{title}': {type(e).__name__}: {str(e)[:200]}")
+            return {**example, "code": code, "verified": None, "fix_attempts": attempt, "output": ""}
+
+        if result["ok"]:
+            return {**example, "code": code, "verified": True,
+                    "fix_attempts": attempt, "output": result["stdout"].strip()}
+
+        error = result["stderr"].strip() or "Unknown error"
+        print(f"[code_agent] '{title}' failed (try {attempt + 1}): {error.splitlines()[-1]}")
+
+        if attempt < MAX_FIX_ATTEMPTS:
+            code = _fix_code(code, error)
+
+    return {**example, "code": code, "verified": False,
+            "fix_attempts": MAX_FIX_ATTEMPTS, "output": ""}
+
+
+def code_agent(state) -> dict:
+    """Reads: brief, outline, feedback.   Writes: code_examples (each one verified by running it)."""
+    brief = state["brief"]
+
+    num_examples = max(2, min(3, brief["duration_minutes"] // 30))
+
+    chain = build_chain(CODE_PROMPT, CodeOutput, temperature=0.2)
+
+    result = chain.invoke({
+        "topic": brief["topic"],
+        "outline": format_outline(state.get("outline")),
+        "level": brief["student_level"],
+        "programming_language": brief["programming_language"],
+        "num_examples": num_examples,
+        "language": brief["language"],
+        "feedback": format_optional(state.get("feedback")),
+    })
+
+    warn_if_count_differs("code_agent", len(result.examples), num_examples)
+
+    examples = [e.model_dump() for e in result.examples]
+
+    # The runner executes Python only. For any other language we skip the check.
+    if brief["programming_language"].strip().lower() == "python":
+        examples = [verify_example(e) for e in examples]
+    else:
+        examples = [{**e, "verified": None, "fix_attempts": 0, "output": ""} for e in examples]
+
+    return {"code_examples": examples}
+
+
+if __name__ == "__main__":
+    fake_state = {
+        "brief": {
+            "topic": "Python decorators",
+            "student_level": "intermediate",
+            "duration_minutes": 60,
+            "programming_language": "Python",
+            "language": "English",
+        },
+        "outline": ["Functions are objects", "Closures", "Writing a decorator"],
+        "feedback": "",
+    }
+    out = code_agent(fake_state)
+
+    assert list(out.keys()) == ["code_examples"]
+    assert len(out["code_examples"]) > 0
+    for e in out["code_examples"]:
+        flag = {True: "verified", False: "STILL BROKEN", None: "not checked"}[e["verified"]]
+        print(f"- {e['title']}: {flag} (fixes: {e['fix_attempts']})")
+        if e["output"]:
+            print("    prints:", e["output"].splitlines()[0])
+    print("code_agent: OK")
+
+===== graph_nodes\draft_agent.py =====
+
+def draft_agent(state) -> dict:
+    """Reads: brief, outline, slides, code_examples, quiz.   Writes: draft.
+
+    No LLM here: it only packs everything into one dict. The keys match what ui/script.js reads.
+    """
+    brief = state["brief"]
+
+    draft = {
+        "topic": brief["topic"],
+        "course_name": brief.get("course_name", ""),
+        "language": brief["language"],
+        "outline": state.get("outline", []),
+        "slides": state.get("slides", []),
+        "code_examples": state.get("code_examples", []),
+        "quiz": state.get("quiz", []),
+    }
+
+    return {
+        "draft": draft,
+        "approval_status": "pending",
+        "messages": ["draft_agent: draft is ready"],
+    }
+
+===== graph_nodes\final_agent.py =====
+
+def final_agent(state) -> dict:
+    """TEMPORARY (Phase 5): just copies the draft.
+
+    Later: create the .pptx / code file / quiz file (Phase 6) and save long-term memory (Phase 9).
+    """
+    return {
+        "final_output": {"draft": state["draft"]},
+        "messages": ["final_agent: done"],
+    }
+
+===== graph_nodes\human_approval.py =====
+
+def human_approval(state) -> dict:
+    """TEMPORARY (Phase 5): approves automatically.
+
+    Phase 8 replaces this with a real pause using interrupt(), so the lecturer decides.
+    """
+    return {"approval_status": "approved"}
+
+===== graph_nodes\orchestrator.py =====
+
+from pydantic import BaseModel, Field
+
+from graph_nodes.utils import format_optional
+from graph_nodes.utils import build_chain, format_optional
+from prompts import ORCHESTRATOR_PROMPT
+from Session_State import AGENT_ORDER, AgentName
+
+# Maps what the lecturer ticks in the form ("needs") to an agent name.
+NEEDS_TO_AGENT = {
+    "slides": "slides_agent",
+    "code": "code_agent",
+    "quiz": "quiz_agent",
+}
+
+
+class RoutingDecision(BaseModel):
+    selected_agents: list[AgentName] = Field(
+        description="The specialist agents that must run. Always includes research_agent."
+    )
+    reasoning: str = Field(
+        description="1 or 2 short sentences for the lecturer explaining why these agents were chosen."
+    )
+
+
+def rule_based_agents(needs: list[str]) -> list[str]:
+    """The simple version: no LLM, just map the checkboxes to agents."""
+    wanted = {NEEDS_TO_AGENT[n] for n in needs if n in NEEDS_TO_AGENT}
+    return [a for a in AGENT_ORDER if a == "research_agent" or a in wanted]
+
+
+def normalize(agents: list[str]) -> list[str]:
+    """Safety net: research_agent is always there, no duplicates, fixed order."""
+    return [a for a in AGENT_ORDER if a == "research_agent" or a in agents]
+
+
+def orchestrator(state) -> dict:
+    """Reads: brief, memory_context, feedback.   Writes: selected_agents, reasoning."""
+    brief = state["brief"]
+
+    chain = build_chain(ORCHESTRATOR_PROMPT, RoutingDecision, temperature=0)
+
+    try:
+        result = chain.invoke({
+            "topic": brief["topic"],
+            "needs": ", ".join(brief["needs"]),
+            "notes": format_optional(brief.get("notes")),
+            "memory_context": format_optional(state.get("memory_context")),
+            "feedback": format_optional(state.get("feedback")),
+            "language": brief["language"],
+        })
+        selected = normalize(result.selected_agents)
+        reasoning = result.reasoning
+    except Exception as e:
+        # Print the real reason, otherwise a wrong API key looks the same as a bad JSON.
+        print(f"[orchestrator] LLM decision failed, using rules. {type(e).__name__}: {str(e)[:300]}")
+        selected = rule_based_agents(brief["needs"])
+        reasoning = "Plan built from the requested outputs."
+
+    return {
+        "selected_agents": selected,
+        "reasoning": reasoning,
+        "messages": [f"orchestrator: {', '.join(selected)}"],
+    }
+
+===== graph_nodes\quiz_agent.py =====
+
+from graph_nodes.utils import format_optional, format_outline, warn_if_count_differs
+from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
+from prompts import QUIZ_PROMPT
+from schemas import QuizOutput
+
+
+def quiz_agent(state) -> dict:
+    """Reads: brief, outline, feedback.   Writes: quiz."""
+    brief = state["brief"]
+
+    # Build the chain inside the function, not at import time: get_llm() needs .env to be loaded.
+    chain = build_chain(QUIZ_PROMPT, QuizOutput, temperature=0.3)
+    result = chain.invoke({
+        "topic": brief["topic"],
+        "outline": format_outline(state.get("outline")),
+        "level": brief["student_level"],
+        "num_questions": brief["num_quiz_questions"],
+        "language": brief["language"],
+        "feedback": format_optional(state.get("feedback")),
+    })
+
+    warn_if_count_differs("quiz_agent", len(result.questions), brief["num_quiz_questions"])
+
+    # A partial update: only the key this node owns. model_dump() -> plain dicts (JSON friendly).
+    return {"quiz": [q.model_dump() for q in result.questions]}
+
+
+if __name__ == "__main__":
+    fake_state = {
+        "brief": {
+            "topic": "Python decorators",
+            "student_level": "intermediate",
+            "num_quiz_questions": 3,
+            "language": "English",
+        },
+        "outline": ["Functions are objects", "Closures", "Writing a decorator"],
+        "feedback": "",
+    }
+
+    out = quiz_agent(fake_state)
+
+    assert list(out.keys()) == ["quiz"], f"unexpected keys: {list(out.keys())}"
+    assert len(out["quiz"]) == 3, f"expected 3 questions, got {len(out['quiz'])}"
+    for q in out["quiz"]:
+        assert len(q["options"]) == 4
+        assert 0 <= q["answer_index"] < 4
+
+    positions = [q["answer_index"] for q in out["quiz"]]
+    print("correct answer positions:", positions)
+    for q in out["quiz"]:
+        print("-", q["question"])
+    print("quiz_agent: OK")
+
+===== graph_nodes\research_agent.py =====
+
+from graph_nodes.utils import build_chain, format_optional
+from MCP_Servers.mcp_client import web_search
+from prompts import RESEARCH_PROMPT
+from schemas import OutlineOutput
+
+NO_SEARCH = "(web search was not available, use well-established knowledge)"
+MAX_SEARCH_CHARS = 6000  # keep the prompt small: search results can be very long
+
+
+def _search(brief: dict) -> str:
+    """Search the web through Tavily (MCP). If it fails, continue without it: never crash the graph."""
+    query = (
+        f"{brief['topic']} {brief.get('programming_language', '')} "
+        f"lecture outline for {brief['student_level']} students"
+    ).strip()
+
+    try:
+        text = web_search(query, max_results=5)
+    except Exception as e:  # the message is already cleaned (no API key) by mcp_client
+        print(f"[research_agent] web search failed, continuing without it: {str(e)[:300]}")
+        return NO_SEARCH
+
+    text = text.strip()
+    if not text:
+        print("[research_agent] web search returned nothing")
+        return NO_SEARCH
+
+    print(f"[research_agent] web search OK ({len(text)} characters)")
+    return text[:MAX_SEARCH_CHARS]
+
+
+def research_agent(state) -> dict:
+    """Reads: brief.   Writes: outline."""
+    brief = state["brief"]
+
+    chain = build_chain(RESEARCH_PROMPT, OutlineOutput, temperature=0.3)
+
+    result = chain.invoke({
+        "topic": brief["topic"],
+        "level": brief["student_level"],
+        "duration": brief["duration_minutes"],
+        "objectives": format_optional(brief.get("learning_objectives")),
+        "search_results": _search(brief),
+    })
+
+    return {"outline": result.sections}
+
+
+if __name__ == "__main__":
+    fake_state = {
+        "brief": {
+            "topic": "Python decorators",
+            "student_level": "intermediate",
+            "duration_minutes": 60,
+            "programming_language": "Python",
+            "learning_objectives": ["Students can write their own decorators."],
+        },
+    }
+    out = research_agent(fake_state)
+
+    assert list(out.keys()) == ["outline"]
+    assert 3 <= len(out["outline"]) <= 10, f"got {len(out['outline'])} sections"
+    for i, s in enumerate(out["outline"], 1):
+        print(f"{i}. {s}")
+    print("research_agent: OK")
+
+===== graph_nodes\slides_agent.py =====
+
+from graph_nodes.utils import build_chain, format_optional, format_outline, warn_if_count_differs
+from llm.llm_provider import get_llm
+from prompts import SLIDES_PROMPT
+from schemas import SlidesOutput
+
+
+def slides_agent(state) -> dict:
+    """Reads: brief, outline, memory_context, feedback.   Writes: slides."""
+    brief = state["brief"]
+
+    # The number of slides is computed in code, then passed to the prompt ready-made.
+    
+    # was: max(5, min(12, duration // 5))
+    num_slides = max(5, min(8, brief["duration_minutes"] // 8))
+
+    chain = build_chain(SLIDES_PROMPT, SlidesOutput, temperature=0.3)
+    result = chain.invoke({
+        "topic": brief["topic"],
+        "outline": format_outline(state.get("outline")),
+        "level": brief["student_level"],
+        "num_slides": num_slides,
+        "language": brief["language"],
+        "memory_context": format_optional(state.get("memory_context")),
+        "feedback": format_optional(state.get("feedback")),
+    })
+
+    warn_if_count_differs("slides_agent", len(result.slides), num_slides)
+
+    return {"slides": [s.model_dump() for s in result.slides]}
+
+
+if __name__ == "__main__":
+    fake_state = {
+        "brief": {
+            "topic": "Python decorators",
+            "student_level": "intermediate",
+            "duration_minutes": 30,
+            "language": "English",
+        },
+        "outline": ["Functions are objects", "Closures", "Writing a decorator"],
+        "memory_context": [],
+        "feedback": "",
+    }
+
+    out = slides_agent(fake_state)
+
+    assert list(out.keys()) == ["slides"], f"unexpected keys: {list(out.keys())}"
+    assert len(out["slides"]) > 0
+    for s in out["slides"]:
+        assert s["title"] and s["bullets"] and s["notes"]
+
+    for i, s in enumerate(out["slides"], 1):
+        print(f"{i}. {s['title']}  ({len(s['bullets'])} bullets)")
+    print("slides_agent: OK")
+
+
+===== graph_nodes\utils.py =====
+
+"""Small helpers shared by all agents, so the same formatting code is not repeated."""
+
+from llm.llm_provider import get_llm
+
+
+def build_chain(prompt, schema, temperature: float = 0.3, attempts: int = 3):
+    """prompt | llm with structured output, retried automatically if the model fails."""
+    llm = get_llm(temperature=temperature).with_structured_output(schema)
+    return (prompt | llm).with_retry(stop_after_attempt=attempts)
+
+def format_outline(outline: list[str] | None) -> str:
+    """['A', 'B'] -> '- A\\n- B' (the prompts expect text, the state stores a list)."""
+    if not outline:
+        return "(no outline available)"
+    return "\n".join(f"- {section}" for section in outline)
+
+
+def format_optional(value) -> str:
+    """
+    Turn an optional state value into prompt text.
+    None / "" / [] -> "None" (the prompts are written for this exact word)
+    list[str]      -> bullet lines
+    str            -> unchanged
+    """
+    if not value:
+        return "None"
+    if isinstance(value, (list, tuple)):
+        return "\n".join(f"- {item}" for item in value)
+    return str(value)
+
+
+def warn_if_count_differs(name: str, got: int, expected: int) -> None:
+    """Models sometimes miss the requested count by one or two. Warn, do not crash."""
+    if got != expected:
+        print(f"[{name}] warning: expected {expected} items, got {got}")
+
+===== graph_nodes\__init__.py =====
+
+
+
+===== llm\llm_provider.py =====
+
+# TODO Phase 2: get_llm() factory
+
+import os
+import sys
+
+from config.settings import LLM_TEMPERATURE, OLLAMA_BASE_URL
+
+PROVIDERS = {
+    "groq":   {"key": "GROQ_API_KEY",   "model_env": "GROQ_MODEL"},
+    "gemini": {"key": "GOOGLE_API_KEY", "model_env": "GEMINI_MODEL"},
+    "xai":    {"key": "XAI_API_KEY",    "model_env": "XAI_MODEL"},
+    "ollama": {"key": None,             "model_env": "OLLAMA_MODEL"},
+}
+
+_chosen_provider: str | None = None
+
+
+def _missing(provider: str) -> list[str]:
+    """Env vars that are still empty for this provider."""
+    cfg = PROVIDERS[provider]
+    needed = [cfg["model_env"]] + ([cfg["key"]] if cfg["key"] else [])
+    return [name for name in needed if not os.getenv(name)]
+
+
+def _validate(provider: str) -> str:
+    provider = provider.strip().lower()
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unknown provider '{provider}'. Choose from: {list(PROVIDERS)}")
+    missing = _missing(provider)
+    if missing:
+        raise RuntimeError(f"Missing in .env for provider '{provider}': {', '.join(missing)}")
+    return provider
+
+
+def _ask(ready: list[str]) -> str:
+    print("Which LLM do you want to use?")
+    for i, p in enumerate(ready, 1):
+        print(f"  {i}) {p}")
+    while True:
+        choice = input("Number: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(ready):
+            return ready[int(choice) - 1]
+        print(f"Please enter a number between 1 and {len(ready)}.")
+
+
+def choose_provider(ask: bool = False) -> str:
+    """
+    Priority: LLM_PROVIDER from .env -> ask in terminal (only if ask=True) -> first ready provider.
+    The choice is cached, so it happens once per run.
+    """
+    global _chosen_provider
+    if _chosen_provider:
+        return _chosen_provider
+
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+
+    if not provider:
+        ready = [p for p in PROVIDERS if not _missing(p)]
+        if not ready:
+            raise RuntimeError(
+                "No LLM provider is configured. Set a provider's API key and model name in .env."
+            )
+        if ask and sys.stdin.isatty() and len(ready) > 1:
+            provider = _ask(ready)
+        else:
+            provider = ready[0]
+            print(f"[llm] LLM_PROVIDER is not set, using '{provider}'.", file=sys.stderr)
+
+    _chosen_provider = _validate(provider)
+    return _chosen_provider
+
+
+def get_llm(provider: str | None = None, temperature: float | None = None):
+    """
+    get_llm()                              -> the globally chosen provider
+    get_llm(provider="gemini")             -> force a provider for this agent
+    get_llm(temperature=0.7)               -> override the temperature
+    """
+    provider = _validate(provider) if provider else choose_provider()
+    temperature = LLM_TEMPERATURE if temperature is None else temperature
+    model = os.environ[PROVIDERS[provider]["model_env"]]
+
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+        return ChatGroq(model=model, temperature=temperature)
+
+    if provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model=model, temperature=temperature)
+
+    if provider == "xai":
+        from langchain_xai import ChatXAI
+        return ChatXAI(model=model, temperature=temperature)
+
+    from langchain_ollama import ChatOllama
+    return ChatOllama(model=model, base_url=OLLAMA_BASE_URL, temperature=temperature)
+
+===== llm\__init__.py =====
+
+
+
+===== MCP_Servers\code_runner_server.py =====
+
+"""
+Custom MCP server with ONE tool: run_python(code).
+
+The code_agent uses it to check that a generated example really runs before showing it
+to the lecturer.
+
+Safety (read this):
+- The code runs in a SEPARATE process, with a timeout, in an empty temp folder.
+- The child process gets a minimal environment, so your API keys in .env are NOT visible to it.
+- The output is truncated.
+- It does NOT block the network or the disk. This is a local-development tool. For any public
+  deployment run it inside Docker with `--network none` (Phase 12).
+
+Run the server by itself (it waits for an MCP client on stdin/stdout):
+    uv run python MCP_Servers/code_runner_server.py
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("code_runner")
+
+TIMEOUT_SECONDS = 5
+MAX_OUTPUT_CHARS = 4000
+
+# Only these variables are passed to the child process. Windows needs SYSTEMROOT to start Python.
+_SAFE_ENV_KEYS = ("PATH", "SYSTEMROOT", "TEMP", "TMP")
+
+
+def _clip(text: str) -> str:
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    return text[:MAX_OUTPUT_CHARS] + "\n...[output truncated]"
+
+
+def _clean_env() -> dict[str, str]:
+    return {k: os.environ[k] for k in _SAFE_ENV_KEYS if k in os.environ}
+
+
+@mcp.tool()
+def run_python(code: str) -> str:
+    """Run a Python snippet with a time limit.
+
+    Returns a JSON string: {"ok": bool, "timed_out": bool, "stdout": str, "stderr": str}.
+    ok is true only if the program exited with code 0.
+    """
+    with tempfile.TemporaryDirectory() as workdir:
+        script = Path(workdir) / "snippet.py"
+        script.write_text(code, encoding="utf-8")
+
+        try:
+            # -I = isolated mode: ignores PYTHON* variables and the user's site-packages.
+            proc = subprocess.run(
+                [sys.executable, "-I", str(script)],
+                cwd=workdir,
+                env=_clean_env(),
+                # The server's own stdin carries the MCP messages. The child must never touch it,
+                # so it gets an empty stdin (input() inside the snippet fails fast with EOFError).
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=TIMEOUT_SECONDS,
+            )
+            result = {
+                "ok": proc.returncode == 0,
+                "timed_out": False,
+                "stdout": _clip(proc.stdout),
+                "stderr": _clip(proc.stderr),
+            }
+        except subprocess.TimeoutExpired:
+            result = {
+                "ok": False,
+                "timed_out": True,
+                "stdout": "",
+                "stderr": f"Timed out after {TIMEOUT_SECONDS} seconds.",
+            }
+
+    return json.dumps(result)
+
+
+if __name__ == "__main__":
+    mcp.run()  # stdio transport
+
+===== MCP_Servers\mcp_client.py =====
+
+"""
+MCP client: the bridge between our graph and the MCP servers.
+
+It knows two servers: code_runner (our own, stdio) and Tavily (hosted by Tavily, streamable HTTP).
+pptx_server is added the same way later: one more entry in `_server_config()`.
+
+The graph nodes are normal (sync) functions, but MCP is async. `run_python_code()` hides that,
+so code_agent can simply call it like a normal function.
+"""
+
+import asyncio
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+from config.settings import TAVILY_API_KEY
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Tavily's hosted MCP server. The API key travels in the URL (that is how Tavily designed it),
+# so we must never print the URL or an error message that contains it. See _describe().
+TAVILY_MCP_URL = os.getenv("TAVILY_MCP_URL", "https://mcp.tavily.com/mcp/")
+
+
+def _server_config() -> dict:
+    config = {
+        "code_runner": {
+            "transport": "stdio",
+            # sys.executable = the python of the current virtual environment
+            "command": sys.executable,
+            "args": [str(BASE_DIR / "MCP_Servers" / "code_runner_server.py")],
+        },
+    }
+    if TAVILY_API_KEY:
+        config["tavily"] = {
+            "transport": "streamable_http",
+            "url": f"{TAVILY_MCP_URL}?tavilyApiKey={TAVILY_API_KEY}",
+        }
+    return config
+
+
+def _describe(error: BaseException) -> str:
+    """Readable error text: flattens ExceptionGroup and hides the Tavily API key."""
+    if isinstance(error, BaseExceptionGroup):
+        text = "; ".join(_describe(e) for e in error.exceptions)
+    else:
+        text = f"{type(error).__name__}: {error}"
+    if TAVILY_API_KEY:
+        text = text.replace(TAVILY_API_KEY, "***")
+    return text
+
+
+def run_async(coro):
+    """Run a coroutine from sync code, even if an event loop is already running (e.g. FastAPI)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # no loop running: the normal case
+
+    # A loop is already running in this thread: run the coroutine in a helper thread.
+    box: dict = {}
+
+    def worker():
+        try:
+            box["value"] = asyncio.run(coro)
+        except BaseException as e:  # noqa: BLE001 - re-raised below in the caller's thread
+            box["error"] = e
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def _tool_text(result) -> str:
+    """A tool reply is a string or a list of content blocks. Return it as plain text."""
+    if isinstance(result, str):
+        return result
+    parts = []
+    for block in result:
+        parts.append(block if isinstance(block, str) else block.get("text", ""))
+    return "".join(parts)
+
+
+async def _call_tool(server: str, is_wanted, args: dict) -> str:
+    """Connect to one server, find the tool that `is_wanted(name)` accepts, call it, return text."""
+    client = MultiServerMCPClient(_server_config())
+    tools = await client.get_tools(server_name=server)
+    tool = next((t for t in tools if is_wanted(t.name)), None)
+    if tool is None:
+        raise RuntimeError(f"No matching tool on server '{server}'. Available: {[t.name for t in tools]}")
+    return _tool_text(await tool.ainvoke(args))
+
+
+def run_python_code(code: str) -> dict:
+    """Run Python code through the code_runner server.
+
+    Returns {"ok": bool, "timed_out": bool, "stdout": str, "stderr": str}.
+    """
+    text = run_async(_call_tool("code_runner", lambda name: name == "run_python", {"code": code}))
+    return json.loads(text)
+
+
+def web_search(query: str, max_results: int = 5) -> str:
+    """Search the web through Tavily's MCP server. Returns the results as text.
+
+    Raises RuntimeError (with the API key removed from the message) if anything goes wrong.
+    """
+    if not TAVILY_API_KEY:
+        raise RuntimeError("TAVILY_API_KEY is not set in .env")
+
+    # Tavily names it "tavily-search"; some wrappers use "tavily_search". Accept both,
+    # but not "tavily-research" (which also contains the word "search").
+    def is_search(name: str) -> bool:
+        return name.lower().replace("_", "-") == "tavily-search"
+
+    try:
+        return run_async(_call_tool("tavily", is_search, {"query": query, "max_results": max_results}))
+    except Exception as e:
+        raise RuntimeError(_describe(e)) from None
+
+
+if __name__ == "__main__":
+    print(run_python_code("print('hello from MCP')"))
+    print(run_python_code("print(1/0)"))
+
+    if TAVILY_API_KEY:
+        print("--- Tavily ---")
+        print(web_search("Python decorators tutorial", max_results=2)[:600])
+    else:
+        print("(TAVILY_API_KEY is not set, skipping the Tavily check)")
+
+===== MCP_Servers\pptx_server.py =====
+
+# TODO Phase 6: custom MCP server -> create .pptx
+
+===== MCP_Servers\__init__.py =====
+
+
+
+===== routes\session_routes.py =====
+
+# TODO Phase 11: POST /api/session , POST /api/session/approve
+
+===== routes\__init__.py =====
+
+
+
+===== ui\ui\index.html =====
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lecturer Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Lecturer Assistant</span>
+    </div>
+    <a class="topbar-link" href="https://github.com/YOUR-USERNAME/lecturer-agentic-assistant">View on GitHub</a>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT: session brief -->
+    <section class="brief" aria-labelledby="brief-title">
+      <h1 id="brief-title">Prepare your next session</h1>
+      <p class="lede">Describe the session. You'll get slides, code examples and a quiz to review before anything is finalized.</p>
+
+      <form id="brief-form" novalidate>
+        <div class="field">
+          <label for="lecturer">Your name</label>
+          <input id="lecturer" name="lecturer_id" type="text" placeholder="Dr. Sara" autocomplete="name" required>
+          <p class="hint">Used to remember your preferences across sessions.</p>
+        </div>
+
+        <div class="field">
+          <label for="topic">Session topic</label>
+          <input id="topic" name="topic" type="text" placeholder="Python decorators" required>
+        </div>
+
+        <div class="field">
+          <label for="course">Course</label>
+          <input id="course" name="course_name" type="text" placeholder="Advanced Python">
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="level">Student level</label>
+            <select id="level" name="student_level">
+              <option value="beginner">Beginner</option>
+              <option value="intermediate" selected>Intermediate</option>
+              <option value="advanced">Advanced</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="duration">Duration (min)</label>
+            <input id="duration" name="duration_minutes" type="number" min="15" max="240" step="5" value="90">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="language">Teaching language</label>
+            <select id="language" name="language">
+              <option value="English">English</option>
+              <option value="Arabic">Arabic</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="proglang">Code language</label>
+            <select id="proglang" name="programming_language">
+              <option value="Python">Python</option>
+              <option value="JavaScript">JavaScript</option>
+              <option value="Java">Java</option>
+              <option value="C++">C++</option>
+            </select>
+          </div>
+        </div>
+
+        <fieldset class="field needs">
+          <legend>What should I prepare?</legend>
+          <label class="chip"><input type="checkbox" name="needs" value="slides" checked><span>Slides</span></label>
+          <label class="chip"><input type="checkbox" name="needs" value="code" checked><span>Code</span></label>
+          <label class="chip"><input type="checkbox" name="needs" value="quiz" checked><span>Quiz</span></label>
+        </fieldset>
+
+        <div class="field">
+          <label for="nq">Number of quiz questions</label>
+          <input id="nq" name="num_quiz_questions" type="number" min="3" max="20" value="8">
+        </div>
+
+        <div class="field">
+          <label for="objectives">Learning objectives</label>
+          <textarea id="objectives" name="learning_objectives" rows="3" placeholder="Students can explain what a decorator is and write their own."></textarea>
+        </div>
+
+        <div class="field">
+          <label for="notes">Anything else?</label>
+          <textarea id="notes" name="notes" rows="2" placeholder="Keep slides short. Add one hands-on exercise."></textarea>
+        </div>
+
+        <button type="submit" id="generate" class="btn primary">Generate session</button>
+      </form>
+    </section>
+
+    <!-- RIGHT: workspace -->
+    <section class="workspace" aria-live="polite">
+      <ol class="pipeline" id="pipeline" aria-label="Progress">
+        <li data-step="plan"><span>Plan</span></li>
+        <li data-step="research"><span>Research</span></li>
+        <li data-step="slides"><span>Slides</span></li>
+        <li data-step="code"><span>Code</span></li>
+        <li data-step="quiz"><span>Quiz</span></li>
+        <li data-step="draft"><span>Draft</span></li>
+        <li data-step="review"><span>Your review</span></li>
+        <li data-step="final"><span>Final files</span></li>
+      </ol>
+
+      <div id="empty" class="empty">
+        <h2>Nothing here yet</h2>
+        <p>Fill in the brief and choose <strong>Generate session</strong>. The draft will appear here for your review.</p>
+      </div>
+
+      <div id="error" class="error" role="alert" hidden></div>
+
+      <div id="result" hidden>
+        <div class="plan-note" id="plan-note"></div>
+
+        <div class="tabs" role="tablist" aria-label="Draft sections">
+          <button role="tab" id="tab-outline" aria-selected="true" aria-controls="panel-outline">Outline</button>
+          <button role="tab" id="tab-slides" aria-selected="false" aria-controls="panel-slides" tabindex="-1">Slides</button>
+          <button role="tab" id="tab-code" aria-selected="false" aria-controls="panel-code" tabindex="-1">Code</button>
+          <button role="tab" id="tab-quiz" aria-selected="false" aria-controls="panel-quiz" tabindex="-1">Quiz</button>
+        </div>
+
+        <div class="panel" id="panel-outline" role="tabpanel" aria-labelledby="tab-outline"></div>
+        <div class="panel" id="panel-slides" role="tabpanel" aria-labelledby="tab-slides" hidden></div>
+        <div class="panel" id="panel-code" role="tabpanel" aria-labelledby="tab-code" hidden></div>
+        <div class="panel" id="panel-quiz" role="tabpanel" aria-labelledby="tab-quiz" hidden></div>
+
+        <aside class="memory" id="memory" hidden>
+          <h3>What I remembered from your earlier sessions</h3>
+          <ul id="memory-list"></ul>
+        </aside>
+
+        <div class="review" id="review">
+          <label for="feedback">Changes you want (optional)</label>
+          <textarea id="feedback" rows="2" placeholder="Fewer words on each slide. Add a harder quiz question."></textarea>
+          <div class="review-actions">
+            <button type="button" id="revise" class="btn ghost">Request changes</button>
+            <button type="button" id="approve" class="btn primary">Approve and create files</button>
+          </div>
+        </div>
+
+        <div class="files" id="files" hidden>
+          <h3>Your files are ready</h3>
+          <ul id="files-list"></ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
+
+===== ui\ui\script.js =====
+
+// ---------------------------------------------------------------
+// Set DEMO_MODE = false once the FastAPI backend is running.
+// In demo mode the page uses fake data so you can preview the UI.
+// ---------------------------------------------------------------
+const DEMO_MODE = true;
+const API_BASE = "";   // same origin as the FastAPI app
+
+const $ = (id) => document.getElementById(id);
+let sessionId = null;
+
+/* ---------- tiny DOM helper (uses textContent, never innerHTML) ---------- */
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else node.setAttribute(k, v);
+  }
+  [].concat(children).forEach((c) => c && node.appendChild(c));
+  return node;
+}
+
+/* ---------- pipeline strip ---------- */
+const STEP_ORDER = ["plan", "research", "slides", "code", "quiz", "draft", "review", "final"];
+
+function setPipeline(selected, active) {
+  const optional = ["research", "slides", "code", "quiz"];
+  document.querySelectorAll("#pipeline li").forEach((li) => {
+    const step = li.dataset.step;
+    li.className = "";
+    if (optional.includes(step) && selected && !selected.includes(step)) {
+      li.classList.add("skipped");
+    } else if (STEP_ORDER.indexOf(step) < STEP_ORDER.indexOf(active)) {
+      li.classList.add("done");
+    } else if (step === active) {
+      li.classList.add("active");
+    }
+  });
+}
+
+/* ---------- tabs ---------- */
+const tabs = ["outline", "slides", "code", "quiz"];
+
+function showTab(name) {
+  tabs.forEach((t) => {
+    const selected = t === name;
+    $(`tab-${t}`).setAttribute("aria-selected", selected);
+    $(`tab-${t}`).tabIndex = selected ? 0 : -1;
+    $(`panel-${t}`).hidden = !selected;
+  });
+}
+tabs.forEach((t) => $(`tab-${t}`).addEventListener("click", () => showTab(t)));
+
+/* ---------- renderers ---------- */
+function renderDraft(data) {
+  const d = data.draft;
+
+  $("plan-note").replaceChildren(
+    el("strong", { text: "Plan: " }),
+    document.createTextNode(data.reasoning || "Agents selected from your brief.")
+  );
+
+  // outline
+  const ol = el("ol", { class: "outline-list" }, (d.outline || []).map((s) => el("li", { text: s })));
+  $("panel-outline").replaceChildren(ol);
+
+  // slides
+  $("panel-slides").replaceChildren(
+    ...((d.slides || []).map((s) =>
+      el("article", { class: "slide" }, [
+        el("h3", { text: s.title }),
+        el("ul", {}, (s.bullets || []).map((b) => el("li", { text: b }))),
+        s.notes ? el("p", { class: "notes", text: "Speaker notes: " + s.notes }) : null,
+      ])
+    ))
+  );
+  if (!(d.slides || []).length) $("panel-slides").replaceChildren(el("p", { text: "Slides were not requested." }));
+
+  // code
+  $("panel-code").replaceChildren(
+    ...((d.code_examples || []).map((c) =>
+      el("div", { class: "code-block" }, [
+        el("h3", { text: c.title }),
+        el("pre", {}, [el("code", { text: c.code })]),
+        el("p", { text: c.explanation }),
+      ])
+    ))
+  );
+  if (!(d.code_examples || []).length) $("panel-code").replaceChildren(el("p", { text: "Code was not requested." }));
+
+  // quiz
+  $("panel-quiz").replaceChildren(
+    ...((d.quiz || []).map((q, i) =>
+      el("div", { class: "q" }, [
+        el("p", { class: "q-title", text: `${i + 1}. ${q.question}` }),
+        el("ol", {}, q.options.map((o, idx) =>
+          el("li", { class: idx === q.answer_index ? "correct" : "", text: o })
+        )),
+        el("p", { class: "why", text: q.explanation }),
+      ])
+    ))
+  );
+  if (!(d.quiz || []).length) $("panel-quiz").replaceChildren(el("p", { text: "Quiz was not requested." }));
+
+  // long-term memory
+  const mem = data.memory || [];
+  $("memory").hidden = mem.length === 0;
+  $("memory-list").replaceChildren(...mem.map((m) => el("li", { text: m })));
+}
+
+function showError(msg) {
+  const box = $("error");
+  box.textContent = msg;
+  box.hidden = !msg;
+}
+
+/* ---------- API ---------- */
+async function post(path, body) {
+  const res = await fetch(API_BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Server returned ${res.status}. Check that the backend is running.`);
+  return res.json();
+}
+
+function collectBrief() {
+  const f = $("brief-form");
+  const fd = new FormData(f);
+  return {
+    lecturer_id: fd.get("lecturer_id").trim(),
+    topic: fd.get("topic").trim(),
+    course_name: fd.get("course_name").trim(),
+    student_level: fd.get("student_level"),
+    duration_minutes: Number(fd.get("duration_minutes")),
+    language: fd.get("language"),
+    programming_language: fd.get("programming_language"),
+    needs: fd.getAll("needs"),
+    num_quiz_questions: Number(fd.get("num_quiz_questions")),
+    learning_objectives: fd.get("learning_objectives").trim(),
+    notes: fd.get("notes").trim(),
+  };
+}
+
+/* ---------- actions ---------- */
+$("brief-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  showError("");
+
+  const brief = collectBrief();
+  ["lecturer", "topic"].forEach((id) => $(id).classList.toggle("invalid", !$(id).value.trim()));
+  if (!brief.lecturer_id || !brief.topic) return showError("Enter your name and the session topic.");
+  if (brief.needs.length === 0) return showError("Choose at least one thing to prepare.");
+
+  const btn = $("generate");
+  btn.disabled = true;
+  btn.textContent = "Generating...";
+  $("empty").hidden = true;
+  $("result").hidden = true;
+  $("files").hidden = true;
+  setPipeline(brief.needs, "plan");
+
+  try {
+    const data = DEMO_MODE ? await demoStart(brief) : await post("/api/session", brief);
+    sessionId = data.session_id;
+    setPipeline(data.selected_agents.map((a) => a.replace("_agent", "")), "review");
+    renderDraft(data);
+    showTab("outline");
+    $("review").hidden = false;
+    $("result").hidden = false;
+  } catch (err) {
+    $("empty").hidden = false;
+    setPipeline(null, "");
+    showError(err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Generate session";
+  }
+});
+
+async function sendDecision(decision) {
+  showError("");
+  const payload = { session_id: sessionId, decision, feedback: $("feedback").value.trim() };
+  $("approve").disabled = $("revise").disabled = true;
+  try {
+    if (decision === "approve") {
+      const data = DEMO_MODE ? await demoApprove() : await post("/api/session/approve", payload);
+      setPipeline(null, "final");
+      document.querySelectorAll("#pipeline li").forEach((li) => (li.className = "done"));
+      $("files-list").replaceChildren(
+        ...data.files.map((f) =>
+          el("li", {}, [el("a", { href: f.url, text: f.name })])
+        )
+      );
+      $("review").hidden = true;
+      $("files").hidden = false;
+    } else {
+      setPipeline(null, "plan");
+      const data = DEMO_MODE ? await demoStart(collectBrief()) : await post("/api/session/approve", payload);
+      renderDraft(data);
+      setPipeline(data.selected_agents.map((a) => a.replace("_agent", "")), "review");
+      $("feedback").value = "";
+    }
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    $("approve").disabled = $("revise").disabled = false;
+  }
+}
+$("approve").addEventListener("click", () => sendDecision("approve"));
+$("revise").addEventListener("click", () => sendDecision("revise"));
+
+/* ---------- demo data (remove when the backend is ready) ---------- */
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function demoStart(brief) {
+  await wait(900);
+  return {
+    session_id: "demo-thread-1",
+    selected_agents: ["research_agent", "slides_agent", "code_agent", "quiz_agent"]
+      .filter((a) => brief.needs.includes(a.replace("_agent", "")) || a === "research_agent"),
+    reasoning: `You asked for ${brief.needs.join(", ")}. Research runs first so the other parts share one outline.`,
+    memory: ["Prefers short slides (5 bullets max).", "Teaches in English, code in Python."],
+    draft: {
+      outline: ["What a function is, as an object", "Closures", "Writing a decorator", "Decorators with arguments", "Hands-on exercise"],
+      slides: [
+        { title: "Functions are objects", bullets: ["Assign them to variables", "Pass them as arguments", "Return them from other functions"], notes: "Show a 3-line example live." },
+        { title: "Writing a decorator", bullets: ["Wrap a function", "Add behavior before and after", "Use @ syntax"], notes: "Ask students to predict the output first." },
+      ],
+      code_examples: [
+        {
+          title: "A timing decorator",
+          code: "import time\n\ndef timer(fn):\n    def wrapper(*args, **kwargs):\n        start = time.perf_counter()\n        result = fn(*args, **kwargs)\n        print(f'{fn.__name__} took {time.perf_counter() - start:.4f}s')\n        return result\n    return wrapper\n\n@timer\ndef work():\n    sum(range(1_000_000))\n\nwork()",
+          explanation: "Verified: runs without errors. Prints the elapsed time of work().",
+        },
+      ],
+      quiz: [
+        { question: "What does the @ syntax do?", options: ["Imports a module", "Applies a decorator to a function", "Creates a class", "Declares a variable"], answer_index: 1, explanation: "@d above a function is shorthand for f = d(f)." },
+        { question: "Why do decorators usually accept *args and **kwargs?", options: ["To run faster", "To work with any function signature", "To avoid imports", "To hide errors"], answer_index: 1, explanation: "The wrapper must forward whatever arguments the original function takes." },
+      ],
+    },
+  };
+}
+
+async function demoApprove() {
+  await wait(700);
+  return {
+    status: "done",
+    files: [
+      { name: "python-decorators.pptx", url: "#" },
+      { name: "examples.py", url: "#" },
+      { name: "quiz.json", url: "#" },
+    ],
+  };
+}
+
+===== ui\ui\style.css =====
+
+:root {
+  --ink: #1b2540;
+  --ink-soft: #4a5572;
+  --paper: #f3f5f9;
+  --surface: #ffffff;
+  --line: #d5dae5;
+  --blue: #3a5bd9;
+  --highlight: #ffe066;
+  --red-pen: #c93a3a;
+  --ok: #1f7a4d;
+
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+  --font-code: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; }
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+h1, h2, h3 {
+  font-family: var(--font-display);
+  line-height: 1.15;
+  margin: 0 0 .5rem;
+}
+
+:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 2px;
+}
+
+/* ---------- top bar ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 28px;
+  background: var(--ink);
+  color: #fff;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-mark {
+  width: 22px; height: 22px;
+  background: var(--highlight);
+  border-radius: 3px;
+  transform: rotate(-4deg);
+}
+.brand-name { font-family: var(--font-display); font-weight: 700; font-size: 1.1rem; }
+.topbar-link { color: #fff; opacity: .8; text-decoration: none; font-size: .9rem; }
+.topbar-link:hover { opacity: 1; text-decoration: underline; }
+
+/* ---------- layout ---------- */
+.layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 400px) 1fr;
+  gap: 28px;
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 28px;
+  align-items: start;
+}
+
+.brief {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 24px;
+  position: sticky;
+  top: 16px;
+}
+.brief h1 { font-size: 1.7rem; }
+.lede { color: var(--ink-soft); margin: 0 0 1.25rem; max-width: 46ch; }
+
+/* ---------- form ---------- */
+.field { margin-bottom: 14px; border: 0; padding: 0; min-width: 0; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+label, legend {
+  display: block;
+  font-weight: 600;
+  font-size: .9rem;
+  margin-bottom: 4px;
+  padding: 0;
+}
+.hint { margin: 4px 0 0; font-size: .8rem; color: var(--ink-soft); }
+
+input[type="text"], input[type="number"], select, textarea {
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 11px;
+}
+textarea { resize: vertical; }
+input:focus, select:focus, textarea:focus { border-color: var(--blue); background: #fff; }
+input.invalid { border-color: var(--red-pen); }
+
+.needs { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.needs legend { width: 100%; }
+.chip { margin: 0; cursor: pointer; }
+.chip input { position: absolute; opacity: 0; pointer-events: none; }
+.chip span {
+  display: inline-block;
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  font-weight: 500;
+  font-size: .9rem;
+  transition: background .15s;
+}
+.chip input:checked + span { background: var(--highlight); border-color: #d9b800; }
+.chip input:focus-visible + span { outline: 3px solid var(--blue); outline-offset: 2px; }
+
+/* ---------- buttons ---------- */
+.btn {
+  font: inherit;
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 10px 18px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.btn.primary { background: var(--ink); color: #fff; width: 100%; }
+.btn.primary:hover { background: #26335a; }
+.btn.ghost { background: transparent; border-color: var(--red-pen); color: var(--red-pen); }
+.btn.ghost:hover { background: #fbeaea; }
+.btn:disabled { opacity: .55; cursor: wait; }
+
+/* ---------- pipeline ---------- */
+.pipeline {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 20px;
+  padding: 0;
+}
+.pipeline li {
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: .85rem;
+  color: var(--ink-soft);
+}
+.pipeline li.done { color: var(--ink); border-color: var(--ink); }
+.pipeline li.active {
+  color: var(--ink);
+  font-weight: 600;
+  border-color: var(--ink);
+  background: linear-gradient(transparent 55%, var(--highlight) 55%);
+}
+.pipeline li.skipped { text-decoration: line-through; opacity: .5; }
+
+/* ---------- empty / error ---------- */
+.empty {
+  border: 2px dashed var(--line);
+  border-radius: 10px;
+  padding: 56px 24px;
+  text-align: center;
+  color: var(--ink-soft);
+}
+.empty h2 { color: var(--ink); }
+.empty p { margin: 0 auto; max-width: 44ch; }
+
+.error {
+  background: #fbeaea;
+  border: 1px solid var(--red-pen);
+  color: #7a1f1f;
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+
+/* ---------- result ---------- */
+.plan-note {
+  font-size: .9rem;
+  color: var(--ink-soft);
+  margin-bottom: 14px;
+}
+.plan-note strong { color: var(--ink); }
+
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
+.tabs button {
+  font: inherit;
+  font-weight: 600;
+  background: none;
+  border: 0;
+  padding: 10px 16px;
+  cursor: pointer;
+  color: var(--ink-soft);
+  border-bottom: 3px solid transparent;
+  margin-bottom: -1px;
+}
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 10px 10px;
+  padding: 22px;
+}
+
+.outline-list { margin: 0; padding-left: 1.2rem; }
+.outline-list li { margin-bottom: 6px; }
+
+.slide {
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--ink);
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin-bottom: 14px;
+}
+.slide h3 { font-size: 1.1rem; }
+.slide ul { margin: 6px 0 10px; padding-left: 1.2rem; }
+.slide .notes {
+  font-size: .88rem;
+  color: var(--ink-soft);
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+}
+
+.code-block { margin-bottom: 22px; }
+.code-block pre {
+  background: var(--ink);
+  color: #e8ecf7;
+  font-family: var(--font-code);
+  font-size: .88rem;
+  padding: 14px 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.code-block p { margin: 0; color: var(--ink-soft); }
+
+.q { margin-bottom: 22px; }
+.q-title { font-weight: 600; margin-bottom: 6px; }
+.q ol { list-style: upper-alpha; margin: 0 0 6px; padding-left: 1.6rem; }
+.q li.correct { background: linear-gradient(transparent 50%, var(--highlight) 50%); width: fit-content; }
+.q .why { font-size: .88rem; color: var(--ink-soft); margin: 0; }
+
+.memory {
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 16px;
+  background: #fffbe0;
+}
+.memory h3 { font-size: .95rem; margin-bottom: 4px; }
+.memory ul { margin: 0; padding-left: 1.1rem; font-size: .9rem; }
+
+.review {
+  margin-top: 18px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.review textarea { margin-bottom: 12px; }
+.review-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.review-actions .btn.primary { width: auto; }
+
+.files {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--ok);
+  background: #eef8f2;
+  border-radius: 10px;
+}
+.files h3 { color: var(--ok); }
+.files ul { margin: 0; padding-left: 1.1rem; }
+
+/* ---------- responsive ---------- */
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; padding: 16px; }
+  .brief { position: static; }
+  .review-actions { flex-direction: column-reverse; }
+  .review-actions .btn { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+
+===== ui\index.html =====
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lecturer Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Lecturer Assistant</span>
+    </div>
+    <a class="topbar-link" href="https://github.com/YOUR-USERNAME/lecturer-agentic-assistant">View on GitHub</a>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT: session brief -->
+    <section class="brief" aria-labelledby="brief-title">
+      <h1 id="brief-title">Prepare your next session</h1>
+      <p class="lede">Describe the session. You'll get slides, code examples and a quiz to review before anything is finalized.</p>
+
+      <form id="brief-form" novalidate>
+        <div class="field">
+          <label for="lecturer">Your name</label>
+          <input id="lecturer" name="lecturer_id" type="text" placeholder="Dr. Sara" autocomplete="name" required>
+          <p class="hint">Used to remember your preferences across sessions.</p>
+        </div>
+
+        <div class="field">
+          <label for="topic">Session topic</label>
+          <input id="topic" name="topic" type="text" placeholder="Python decorators" required>
+        </div>
+
+        <div class="field">
+          <label for="course">Course</label>
+          <input id="course" name="course_name" type="text" placeholder="Advanced Python">
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="level">Student level</label>
+            <select id="level" name="student_level">
+              <option value="beginner">Beginner</option>
+              <option value="intermediate" selected>Intermediate</option>
+              <option value="advanced">Advanced</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="duration">Duration (min)</label>
+            <input id="duration" name="duration_minutes" type="number" min="15" max="240" step="5" value="90">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="language">Teaching language</label>
+            <select id="language" name="language">
+              <option value="English">English</option>
+              <option value="Arabic">Arabic</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="proglang">Code language</label>
+            <select id="proglang" name="programming_language">
+              <option value="Python">Python</option>
+              <option value="JavaScript">JavaScript</option>
+              <option value="Java">Java</option>
+              <option value="C++">C++</option>
+            </select>
+          </div>
+        </div>
+
+        <fieldset class="field needs">
+          <legend>What should I prepare?</legend>
+          <label class="chip"><input type="checkbox" name="needs" value="slides" checked><span>Slides</span></label>
+          <label class="chip"><input type="checkbox" name="needs" value="code" checked><span>Code</span></label>
+          <label class="chip"><input type="checkbox" name="needs" value="quiz" checked><span>Quiz</span></label>
+        </fieldset>
+
+        <div class="field">
+          <label for="nq">Number of quiz questions</label>
+          <input id="nq" name="num_quiz_questions" type="number" min="3" max="20" value="8">
+        </div>
+
+        <div class="field">
+          <label for="objectives">Learning objectives</label>
+          <textarea id="objectives" name="learning_objectives" rows="3" placeholder="Students can explain what a decorator is and write their own."></textarea>
+        </div>
+
+        <div class="field">
+          <label for="notes">Anything else?</label>
+          <textarea id="notes" name="notes" rows="2" placeholder="Keep slides short. Add one hands-on exercise."></textarea>
+        </div>
+
+        <button type="submit" id="generate" class="btn primary">Generate session</button>
+      </form>
+    </section>
+
+    <!-- RIGHT: workspace -->
+    <section class="workspace" aria-live="polite">
+      <ol class="pipeline" id="pipeline" aria-label="Progress">
+        <li data-step="plan"><span>Plan</span></li>
+        <li data-step="research"><span>Research</span></li>
+        <li data-step="slides"><span>Slides</span></li>
+        <li data-step="code"><span>Code</span></li>
+        <li data-step="quiz"><span>Quiz</span></li>
+        <li data-step="draft"><span>Draft</span></li>
+        <li data-step="review"><span>Your review</span></li>
+        <li data-step="final"><span>Final files</span></li>
+      </ol>
+
+      <div id="empty" class="empty">
+        <h2>Nothing here yet</h2>
+        <p>Fill in the brief and choose <strong>Generate session</strong>. The draft will appear here for your review.</p>
+      </div>
+
+      <div id="error" class="error" role="alert" hidden></div>
+
+      <div id="result" hidden>
+        <div class="plan-note" id="plan-note"></div>
+
+        <div class="tabs" role="tablist" aria-label="Draft sections">
+          <button role="tab" id="tab-outline" aria-selected="true" aria-controls="panel-outline">Outline</button>
+          <button role="tab" id="tab-slides" aria-selected="false" aria-controls="panel-slides" tabindex="-1">Slides</button>
+          <button role="tab" id="tab-code" aria-selected="false" aria-controls="panel-code" tabindex="-1">Code</button>
+          <button role="tab" id="tab-quiz" aria-selected="false" aria-controls="panel-quiz" tabindex="-1">Quiz</button>
+        </div>
+
+        <div class="panel" id="panel-outline" role="tabpanel" aria-labelledby="tab-outline"></div>
+        <div class="panel" id="panel-slides" role="tabpanel" aria-labelledby="tab-slides" hidden></div>
+        <div class="panel" id="panel-code" role="tabpanel" aria-labelledby="tab-code" hidden></div>
+        <div class="panel" id="panel-quiz" role="tabpanel" aria-labelledby="tab-quiz" hidden></div>
+
+        <aside class="memory" id="memory" hidden>
+          <h3>What I remembered from your earlier sessions</h3>
+          <ul id="memory-list"></ul>
+        </aside>
+
+        <div class="review" id="review">
+          <label for="feedback">Changes you want (optional)</label>
+          <textarea id="feedback" rows="2" placeholder="Fewer words on each slide. Add a harder quiz question."></textarea>
+          <div class="review-actions">
+            <button type="button" id="revise" class="btn ghost">Request changes</button>
+            <button type="button" id="approve" class="btn primary">Approve and create files</button>
+          </div>
+        </div>
+
+        <div class="files" id="files" hidden>
+          <h3>Your files are ready</h3>
+          <ul id="files-list"></ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
+
+===== ui\script.js =====
+
+// ---------------------------------------------------------------
+// Set DEMO_MODE = false once the FastAPI backend is running.
+// In demo mode the page uses fake data so you can preview the UI.
+// ---------------------------------------------------------------
+const DEMO_MODE = true;
+const API_BASE = "";   // same origin as the FastAPI app
+
+const $ = (id) => document.getElementById(id);
+let sessionId = null;
+
+/* ---------- tiny DOM helper (uses textContent, never innerHTML) ---------- */
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else node.setAttribute(k, v);
+  }
+  [].concat(children).forEach((c) => c && node.appendChild(c));
+  return node;
+}
+
+/* ---------- pipeline strip ---------- */
+const STEP_ORDER = ["plan", "research", "slides", "code", "quiz", "draft", "review", "final"];
+
+function setPipeline(selected, active) {
+  const optional = ["research", "slides", "code", "quiz"];
+  document.querySelectorAll("#pipeline li").forEach((li) => {
+    const step = li.dataset.step;
+    li.className = "";
+    if (optional.includes(step) && selected && !selected.includes(step)) {
+      li.classList.add("skipped");
+    } else if (STEP_ORDER.indexOf(step) < STEP_ORDER.indexOf(active)) {
+      li.classList.add("done");
+    } else if (step === active) {
+      li.classList.add("active");
+    }
+  });
+}
+
+/* ---------- tabs ---------- */
+const tabs = ["outline", "slides", "code", "quiz"];
+
+function showTab(name) {
+  tabs.forEach((t) => {
+    const selected = t === name;
+    $(`tab-${t}`).setAttribute("aria-selected", selected);
+    $(`tab-${t}`).tabIndex = selected ? 0 : -1;
+    $(`panel-${t}`).hidden = !selected;
+  });
+}
+tabs.forEach((t) => $(`tab-${t}`).addEventListener("click", () => showTab(t)));
+
+/* ---------- renderers ---------- */
+function renderDraft(data) {
+  const d = data.draft;
+
+  $("plan-note").replaceChildren(
+    el("strong", { text: "Plan: " }),
+    document.createTextNode(data.reasoning || "Agents selected from your brief.")
+  );
+
+  // outline
+  const ol = el("ol", { class: "outline-list" }, (d.outline || []).map((s) => el("li", { text: s })));
+  $("panel-outline").replaceChildren(ol);
+
+  // slides
+  $("panel-slides").replaceChildren(
+    ...((d.slides || []).map((s) =>
+      el("article", { class: "slide" }, [
+        el("h3", { text: s.title }),
+        el("ul", {}, (s.bullets || []).map((b) => el("li", { text: b }))),
+        s.notes ? el("p", { class: "notes", text: "Speaker notes: " + s.notes }) : null,
+      ])
+    ))
+  );
+  if (!(d.slides || []).length) $("panel-slides").replaceChildren(el("p", { text: "Slides were not requested." }));
+
+  // code
+  $("panel-code").replaceChildren(
+    ...((d.code_examples || []).map((c) =>
+      el("div", { class: "code-block" }, [
+        el("h3", { text: c.title }),
+        el("pre", {}, [el("code", { text: c.code })]),
+        el("p", { text: c.explanation }),
+      ])
+    ))
+  );
+  if (!(d.code_examples || []).length) $("panel-code").replaceChildren(el("p", { text: "Code was not requested." }));
+
+  // quiz
+  $("panel-quiz").replaceChildren(
+    ...((d.quiz || []).map((q, i) =>
+      el("div", { class: "q" }, [
+        el("p", { class: "q-title", text: `${i + 1}. ${q.question}` }),
+        el("ol", {}, q.options.map((o, idx) =>
+          el("li", { class: idx === q.answer_index ? "correct" : "", text: o })
+        )),
+        el("p", { class: "why", text: q.explanation }),
+      ])
+    ))
+  );
+  if (!(d.quiz || []).length) $("panel-quiz").replaceChildren(el("p", { text: "Quiz was not requested." }));
+
+  // long-term memory
+  const mem = data.memory || [];
+  $("memory").hidden = mem.length === 0;
+  $("memory-list").replaceChildren(...mem.map((m) => el("li", { text: m })));
+}
+
+function showError(msg) {
+  const box = $("error");
+  box.textContent = msg;
+  box.hidden = !msg;
+}
+
+/* ---------- API ---------- */
+async function post(path, body) {
+  const res = await fetch(API_BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Server returned ${res.status}. Check that the backend is running.`);
+  return res.json();
+}
+
+function collectBrief() {
+  const f = $("brief-form");
+  const fd = new FormData(f);
+  return {
+    lecturer_id: fd.get("lecturer_id").trim(),
+    topic: fd.get("topic").trim(),
+    course_name: fd.get("course_name").trim(),
+    student_level: fd.get("student_level"),
+    duration_minutes: Number(fd.get("duration_minutes")),
+    language: fd.get("language"),
+    programming_language: fd.get("programming_language"),
+    needs: fd.getAll("needs"),
+    num_quiz_questions: Number(fd.get("num_quiz_questions")),
+    learning_objectives: fd.get("learning_objectives").trim(),
+    notes: fd.get("notes").trim(),
+  };
+}
+
+/* ---------- actions ---------- */
+$("brief-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  showError("");
+
+  const brief = collectBrief();
+  ["lecturer", "topic"].forEach((id) => $(id).classList.toggle("invalid", !$(id).value.trim()));
+  if (!brief.lecturer_id || !brief.topic) return showError("Enter your name and the session topic.");
+  if (brief.needs.length === 0) return showError("Choose at least one thing to prepare.");
+
+  const btn = $("generate");
+  btn.disabled = true;
+  btn.textContent = "Generating...";
+  $("empty").hidden = true;
+  $("result").hidden = true;
+  $("files").hidden = true;
+  setPipeline(brief.needs, "plan");
+
+  try {
+    const data = DEMO_MODE ? await demoStart(brief) : await post("/api/session", brief);
+    sessionId = data.session_id;
+    setPipeline(data.selected_agents.map((a) => a.replace("_agent", "")), "review");
+    renderDraft(data);
+    showTab("outline");
+    $("review").hidden = false;
+    $("result").hidden = false;
+  } catch (err) {
+    $("empty").hidden = false;
+    setPipeline(null, "");
+    showError(err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Generate session";
+  }
+});
+
+async function sendDecision(decision) {
+  showError("");
+  const payload = { session_id: sessionId, decision, feedback: $("feedback").value.trim() };
+  $("approve").disabled = $("revise").disabled = true;
+  try {
+    if (decision === "approve") {
+      const data = DEMO_MODE ? await demoApprove() : await post("/api/session/approve", payload);
+      setPipeline(null, "final");
+      document.querySelectorAll("#pipeline li").forEach((li) => (li.className = "done"));
+      $("files-list").replaceChildren(
+        ...data.files.map((f) =>
+          el("li", {}, [el("a", { href: f.url, text: f.name })])
+        )
+      );
+      $("review").hidden = true;
+      $("files").hidden = false;
+    } else {
+      setPipeline(null, "plan");
+      const data = DEMO_MODE ? await demoStart(collectBrief()) : await post("/api/session/approve", payload);
+      renderDraft(data);
+      setPipeline(data.selected_agents.map((a) => a.replace("_agent", "")), "review");
+      $("feedback").value = "";
+    }
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    $("approve").disabled = $("revise").disabled = false;
+  }
+}
+$("approve").addEventListener("click", () => sendDecision("approve"));
+$("revise").addEventListener("click", () => sendDecision("revise"));
+
+/* ---------- demo data (remove when the backend is ready) ---------- */
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function demoStart(brief) {
+  await wait(900);
+  return {
+    session_id: "demo-thread-1",
+    selected_agents: ["research_agent", "slides_agent", "code_agent", "quiz_agent"]
+      .filter((a) => brief.needs.includes(a.replace("_agent", "")) || a === "research_agent"),
+    reasoning: `You asked for ${brief.needs.join(", ")}. Research runs first so the other parts share one outline.`,
+    memory: ["Prefers short slides (5 bullets max).", "Teaches in English, code in Python."],
+    draft: {
+      outline: ["What a function is, as an object", "Closures", "Writing a decorator", "Decorators with arguments", "Hands-on exercise"],
+      slides: [
+        { title: "Functions are objects", bullets: ["Assign them to variables", "Pass them as arguments", "Return them from other functions"], notes: "Show a 3-line example live." },
+        { title: "Writing a decorator", bullets: ["Wrap a function", "Add behavior before and after", "Use @ syntax"], notes: "Ask students to predict the output first." },
+      ],
+      code_examples: [
+        {
+          title: "A timing decorator",
+          code: "import time\n\ndef timer(fn):\n    def wrapper(*args, **kwargs):\n        start = time.perf_counter()\n        result = fn(*args, **kwargs)\n        print(f'{fn.__name__} took {time.perf_counter() - start:.4f}s')\n        return result\n    return wrapper\n\n@timer\ndef work():\n    sum(range(1_000_000))\n\nwork()",
+          explanation: "Verified: runs without errors. Prints the elapsed time of work().",
+        },
+      ],
+      quiz: [
+        { question: "What does the @ syntax do?", options: ["Imports a module", "Applies a decorator to a function", "Creates a class", "Declares a variable"], answer_index: 1, explanation: "@d above a function is shorthand for f = d(f)." },
+        { question: "Why do decorators usually accept *args and **kwargs?", options: ["To run faster", "To work with any function signature", "To avoid imports", "To hide errors"], answer_index: 1, explanation: "The wrapper must forward whatever arguments the original function takes." },
+      ],
+    },
+  };
+}
+
+async function demoApprove() {
+  await wait(700);
+  return {
+    status: "done",
+    files: [
+      { name: "python-decorators.pptx", url: "#" },
+      { name: "examples.py", url: "#" },
+      { name: "quiz.json", url: "#" },
+    ],
+  };
+}
+
+===== ui\style.css =====
+
+:root {
+  --ink: #1b2540;
+  --ink-soft: #4a5572;
+  --paper: #f3f5f9;
+  --surface: #ffffff;
+  --line: #d5dae5;
+  --blue: #3a5bd9;
+  --highlight: #ffe066;
+  --red-pen: #c93a3a;
+  --ok: #1f7a4d;
+
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+  --font-code: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; }
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+h1, h2, h3 {
+  font-family: var(--font-display);
+  line-height: 1.15;
+  margin: 0 0 .5rem;
+}
+
+:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 2px;
+}
+
+/* ---------- top bar ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 28px;
+  background: var(--ink);
+  color: #fff;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-mark {
+  width: 22px; height: 22px;
+  background: var(--highlight);
+  border-radius: 3px;
+  transform: rotate(-4deg);
+}
+.brand-name { font-family: var(--font-display); font-weight: 700; font-size: 1.1rem; }
+.topbar-link { color: #fff; opacity: .8; text-decoration: none; font-size: .9rem; }
+.topbar-link:hover { opacity: 1; text-decoration: underline; }
+
+/* ---------- layout ---------- */
+.layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 400px) 1fr;
+  gap: 28px;
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 28px;
+  align-items: start;
+}
+
+.brief {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 24px;
+  position: sticky;
+  top: 16px;
+}
+.brief h1 { font-size: 1.7rem; }
+.lede { color: var(--ink-soft); margin: 0 0 1.25rem; max-width: 46ch; }
+
+/* ---------- form ---------- */
+.field { margin-bottom: 14px; border: 0; padding: 0; min-width: 0; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+label, legend {
+  display: block;
+  font-weight: 600;
+  font-size: .9rem;
+  margin-bottom: 4px;
+  padding: 0;
+}
+.hint { margin: 4px 0 0; font-size: .8rem; color: var(--ink-soft); }
+
+input[type="text"], input[type="number"], select, textarea {
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 11px;
+}
+textarea { resize: vertical; }
+input:focus, select:focus, textarea:focus { border-color: var(--blue); background: #fff; }
+input.invalid { border-color: var(--red-pen); }
+
+.needs { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.needs legend { width: 100%; }
+.chip { margin: 0; cursor: pointer; }
+.chip input { position: absolute; opacity: 0; pointer-events: none; }
+.chip span {
+  display: inline-block;
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  font-weight: 500;
+  font-size: .9rem;
+  transition: background .15s;
+}
+.chip input:checked + span { background: var(--highlight); border-color: #d9b800; }
+.chip input:focus-visible + span { outline: 3px solid var(--blue); outline-offset: 2px; }
+
+/* ---------- buttons ---------- */
+.btn {
+  font: inherit;
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 10px 18px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.btn.primary { background: var(--ink); color: #fff; width: 100%; }
+.btn.primary:hover { background: #26335a; }
+.btn.ghost { background: transparent; border-color: var(--red-pen); color: var(--red-pen); }
+.btn.ghost:hover { background: #fbeaea; }
+.btn:disabled { opacity: .55; cursor: wait; }
+
+/* ---------- pipeline ---------- */
+.pipeline {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 20px;
+  padding: 0;
+}
+.pipeline li {
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: .85rem;
+  color: var(--ink-soft);
+}
+.pipeline li.done { color: var(--ink); border-color: var(--ink); }
+.pipeline li.active {
+  color: var(--ink);
+  font-weight: 600;
+  border-color: var(--ink);
+  background: linear-gradient(transparent 55%, var(--highlight) 55%);
+}
+.pipeline li.skipped { text-decoration: line-through; opacity: .5; }
+
+/* ---------- empty / error ---------- */
+.empty {
+  border: 2px dashed var(--line);
+  border-radius: 10px;
+  padding: 56px 24px;
+  text-align: center;
+  color: var(--ink-soft);
+}
+.empty h2 { color: var(--ink); }
+.empty p { margin: 0 auto; max-width: 44ch; }
+
+.error {
+  background: #fbeaea;
+  border: 1px solid var(--red-pen);
+  color: #7a1f1f;
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+
+/* ---------- result ---------- */
+.plan-note {
+  font-size: .9rem;
+  color: var(--ink-soft);
+  margin-bottom: 14px;
+}
+.plan-note strong { color: var(--ink); }
+
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
+.tabs button {
+  font: inherit;
+  font-weight: 600;
+  background: none;
+  border: 0;
+  padding: 10px 16px;
+  cursor: pointer;
+  color: var(--ink-soft);
+  border-bottom: 3px solid transparent;
+  margin-bottom: -1px;
+}
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 10px 10px;
+  padding: 22px;
+}
+
+.outline-list { margin: 0; padding-left: 1.2rem; }
+.outline-list li { margin-bottom: 6px; }
+
+.slide {
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--ink);
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin-bottom: 14px;
+}
+.slide h3 { font-size: 1.1rem; }
+.slide ul { margin: 6px 0 10px; padding-left: 1.2rem; }
+.slide .notes {
+  font-size: .88rem;
+  color: var(--ink-soft);
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+}
+
+.code-block { margin-bottom: 22px; }
+.code-block pre {
+  background: var(--ink);
+  color: #e8ecf7;
+  font-family: var(--font-code);
+  font-size: .88rem;
+  padding: 14px 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.code-block p { margin: 0; color: var(--ink-soft); }
+
+.q { margin-bottom: 22px; }
+.q-title { font-weight: 600; margin-bottom: 6px; }
+.q ol { list-style: upper-alpha; margin: 0 0 6px; padding-left: 1.6rem; }
+.q li.correct { background: linear-gradient(transparent 50%, var(--highlight) 50%); width: fit-content; }
+.q .why { font-size: .88rem; color: var(--ink-soft); margin: 0; }
+
+.memory {
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 16px;
+  background: #fffbe0;
+}
+.memory h3 { font-size: .95rem; margin-bottom: 4px; }
+.memory ul { margin: 0; padding-left: 1.1rem; font-size: .9rem; }
+
+.review {
+  margin-top: 18px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.review textarea { margin-bottom: 12px; }
+.review-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.review-actions .btn.primary { width: auto; }
+
+.files {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--ok);
+  background: #eef8f2;
+  border-radius: 10px;
+}
+.files h3 { color: var(--ok); }
+.files ul { margin: 0; padding-left: 1.1rem; }
+
+/* ---------- responsive ---------- */
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; padding: 16px; }
+  .brief { position: static; }
+  .review-actions { flex-direction: column-reverse; }
+  .review-actions .btn { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+
+===== docker-compose.yml =====
+
+# TODO: Phase 7 (postgres service)
+
+===== Dockerfile =====
+
+# TODO: Phase 12
+
+===== draw_graph.py =====
+
+"""Save the graph diagram as a PNG:   uv run python draw_graph.py"""
+from pathlib import Path
+
+from graph import build_graph
+
+if __name__ == "__main__":
+    graph = build_graph()  # no LLM call happens here, so no API key is needed
+
+    out = Path("docs")
+    out.mkdir(exist_ok=True)
+
+    # The Mermaid text is always saved: it works even when the PNG download fails.
+    (out / "graph.mmd").write_text(graph.get_graph().draw_mermaid(), encoding="utf-8")
+    print("saved docs/graph.mmd")
+
+    try:
+        (out / "graph.png").write_bytes(graph.get_graph().draw_mermaid_png())
+        print("saved docs/graph.png")
+    except Exception as e:
+        print(f"PNG failed ({type(e).__name__}: {e})")
+        print("Open docs/graph.mmd, paste it at https://mermaid.live and export PNG from there.")
+
+===== graph.py =====
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from graph_nodes.code_agent import code_agent
+from graph_nodes.draft_agent import draft_agent
+from graph_nodes.final_agent import final_agent
+from graph_nodes.human_approval import human_approval
+from graph_nodes.orchestrator import orchestrator
+from graph_nodes.quiz_agent import quiz_agent
+from graph_nodes.research_agent import research_agent
+from graph_nodes.slides_agent import slides_agent
+from Session_State import AGENT_ORDER, SessionState, next_agent
+
+# Every place an agent can hand over to (used by the router and by the diagram).
+def targets_after(name: str) -> list[str]:
+    """Where `name` can hand over to: only agents later in the order, or draft_agent."""
+    start = AGENT_ORDER.index(name) + 1 if name in AGENT_ORDER else 0
+    return [*AGENT_ORDER[start:], "draft_agent"]
+
+def route_after(current: str):
+    """Return a router function: 'who runs after `current`?'"""
+    def router(state):
+        return next_agent(state, current)
+    return router
+
+
+def route_after_approval(state) -> str:
+    return "final_agent" if state["approval_status"] == "approved" else "orchestrator"
+
+
+def build_graph(checkpointer=None, store=None):
+    builder = StateGraph(SessionState)
+
+    # 1) nodes
+    builder.add_node("orchestrator", orchestrator)
+    builder.add_node("research_agent", research_agent)
+    builder.add_node("slides_agent", slides_agent)
+    builder.add_node("code_agent", code_agent)
+    builder.add_node("quiz_agent", quiz_agent)
+    builder.add_node("draft_agent", draft_agent)
+    builder.add_node("human_approval", human_approval)
+    builder.add_node("final_agent", final_agent)
+
+    # 2) edges
+    builder.add_edge(START, "orchestrator")
+
+    for name in ["orchestrator", *AGENT_ORDER]:
+        builder.add_conditional_edges(name, route_after(name), targets_after(name))
+    builder.add_edge("draft_agent", "human_approval")
+    builder.add_conditional_edges(
+        "human_approval", route_after_approval, ["final_agent", "orchestrator"]
+    )
+    builder.add_edge("final_agent", END)
+
+    # 3) compile
+    return builder.compile(checkpointer=checkpointer or InMemorySaver(), store=store)
+
+===== GraphController.py =====
+
+# TODO Phase 11: class that wraps graph (run / resume / get state)
+
+
+class GraphController:
+    def __init__(self, graph):
+        self.graph = graph
+
+    def run(self, state):
+        return self.graph.run(state)
+
+    def resume(self, state):
+        return self.graph.resume(state)
+
+    def get_state(self, state):
+        return self.graph.get_state(state)
+
+===== main.py =====
+
+# TODO Phase 11: FastAPI entrypoint
+from llm.llm_provider import choose_provider, get_llm
+
+if __name__ == "__main__":
+    choose_provider(ask=True)   # Ø¨ØªØ³Ø£Ù„ Ù…Ø±Ø© ÙˆØ§Ø­Ø¯Ø© Ù‡Ù†Ø§ Ø¨Ø³
+    # uvicorn.run(...)
+
+
+llm = get_llm()                                   # Ø§Ù„Ø§Ø®ØªÙŠØ§Ø± Ø§Ù„Ø¹Ø§Ù…
+llm = get_llm(provider="gemini", temperature=0.4) # override Ù„Ù€ agent Ù…Ø¹ÙŠÙ†
+
+===== prompts.py =====
+
+# TODO Phase 2: all system prompts
+"""
+All agent prompts in one file. Every prompt answers 4 questions:
+  1) Role  2) Input  3) Output format  4) Rules
+
+Important notes:
+- Any {name} inside the text is a template variable. For a literal brace, write {{ }}.
+  (We do not need literal braces here.)
+- The output format (JSON) is NOT written in the prompt: the schema is sent to the model
+  by with_structured_output(Model).
+- Numbers (num_slides, num_questions, num_examples) are computed in code (in the agent)
+  and passed in ready. Example: num_slides = max(5, duration_minutes // 2)
+- feedback and memory_context: if empty, pass the text "None" instead of an empty string.
+- The prompts are written in English because models follow English instructions more
+  reliably. The language the lecturer wants is set with the {language} variable.
+"""
+
+from langchain_core.prompts import ChatPromptTemplate
+
+# Shared sentence reused by the prompts that write content (slides / code / quiz / orchestrator reasoning)
+_LANGUAGE_RULE = (
+    "Write all explanatory text in {language}. "
+    "Keep technical terms, code, and identifiers in English."
+)
+
+
+# ------------------------------------------------------------ ORCHESTRATOR
+# variables: topic, needs, notes, memory_context, feedback, language
+ORCHESTRATOR_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """\
+You are the planning agent of a system that helps a lecturer prepare one teaching session.
+Decide which specialist agents must run.
+
+Available agents:
+- research_agent: researches the topic and builds the session outline. The other agents depend on its outline, so ALWAYS include it.
+- slides_agent: writes the presentation slides.
+- code_agent: writes and verifies code examples.
+- quiz_agent: writes quiz questions.
+
+Rules:
+- Include slides_agent, code_agent or quiz_agent only if the lecturer asked for it in "needs", or the notes or feedback clearly imply it. Example: "add a hands-on exercise" implies code_agent.
+- If lecturer feedback is present, keep the agents needed to apply it. Do not drop an agent unless the feedback asks for that.
+- Use the lecturer memory only to understand preferences. Do not invent agents because of it.
+- Never output an agent that is not in the list above.
+- Write the reasoning in {language}: 1 or 2 short sentences addressed to the lecturer, explaining why these agents were chosen.
+"""),
+    ("human", """\
+Topic: {topic}
+Requested outputs (needs): {needs}
+Lecturer notes: {notes}
+What I remember about this lecturer: {memory_context}
+Feedback on the previous draft: {feedback}
+"""),
+])
+
+
+# ---------------------------------------------------------------- RESEARCH
+# variables: topic, level, duration, objectives, search_results
+RESEARCH_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """\
+You are an experienced curriculum designer. Build the outline of one teaching session.
+
+Rules:
+- Create between 4 and 8 sections that fit a session of {duration} minutes.
+- Order the sections pedagogically: start with motivation or prerequisites, build up step by step, and finish with practice or a summary.
+- Match the student level: {level}. Do not assume knowledge a student at this level would not have.
+- Cover every learning objective the lecturer listed.
+- Use the search results only to make the content accurate and current. Do not invent facts that are not supported by them or by well-established knowledge.
+- Each section title is short and specific. No numbering inside the titles.
+"""),
+    ("human", """\
+Topic: {topic}
+Student level: {level}
+Duration (minutes): {duration}
+Learning objectives: {objectives}
+
+Search results:
+{search_results}
+"""),
+])
+
+
+# ------------------------------------------------------------------ SLIDES
+# variables: topic, outline, level, num_slides, language, memory_context, feedback
+SLIDES_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """\
+You are an expert at turning a lecture outline into clear presentation slides.
+
+Rules:
+- Write exactly {num_slides} slides. The first slide introduces the session, the last slide summarizes it.
+- Follow the order of the outline and cover every section.
+- Each slide has 3 to 5 bullets, and each bullet is at most 12 words. Slides are visual aids, not paragraphs.
+- Put the longer explanation in the speaker notes (2 to 4 sentences per slide).
+- Match the student level: {level}.
+- Do not put code blocks on slides. Code examples are produced separately. Short inline code names are fine.
+- Respect the lecturer's preferences and feedback below when they are not "None".
+- """ + _LANGUAGE_RULE + """
+"""),
+    ("human", """\
+Topic: {topic}
+Outline:
+{outline}
+
+Lecturer preferences from memory: {memory_context}
+Feedback on the previous draft: {feedback}
+"""),
+])
+
+
+# -------------------------------------------------------------------- CODE
+# variables: topic, outline, level, programming_language, num_examples, language, feedback
+CODE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """\
+You are a teaching assistant who writes code examples for a lecture.
+
+Rules:
+- Write exactly {num_examples} examples in {programming_language}. Each one demonstrates a different idea from the outline, from simple to more advanced.
+- Every example must run as-is, by itself. It must not call input(), read or write files, use the network, or depend on random or time-based output. It must print its results so the output can be verified.
+- Keep each example short enough to show on a screen (about 25 lines at most).
+- Match the student level: {level}.
+- Use clear English names for variables and functions. Comments and the explanation follow the language rule below.
+- The explanation walks through the code step by step and states what it prints.
+- Apply the feedback below when it is not "None".
+- """ + _LANGUAGE_RULE + """
+"""),
+    ("human", """\
+Topic: {topic}
+Outline:
+{outline}
+
+Feedback on the previous draft: {feedback}
+"""),
+])
+
+# ---------------------------------------------------------------- CODE FIX
+# variables: code, error
+# Used by code_agent when an example crashed. The reply is plain text with ONE code block (not JSON):
+# models break JSON when code is inside it, a code block is much safer.
+CODE_FIX_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """\
+You fix broken code. You receive a program and the error it produced when it ran.
+
+Rules:
+- Return the complete corrected program, not a diff and not only the changed lines.
+- Change as little as possible. Keep the same idea, the same names, and the same style of printed output.
+- The program must run by itself: no input(), no files, no network.
+- Reply with ONE code block and nothing else: no text before or after it.
+"""),
+    ("human", """\
+Program:
+{code}
+
+Error:
+{error}
+"""),
+])
+# -------------------------------------------------------------------- QUIZ
+# variables: topic, outline, level, num_questions, language, feedback
+QUIZ_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """\
+You are an assessment designer who writes multiple-choice quiz questions for a lecture.
+
+Rules:
+- Write exactly {num_questions} questions.
+- Each question has exactly 4 options and exactly one correct option.
+- Wrong options must be plausible: base them on common mistakes or misunderstandings, not on obviously silly answers.
+- Do not use "all of the above" or "none of the above".
+- Spread the correct answer across different positions. Do not always put it in the same place.
+- Cover the outline evenly. Mix easy, medium, and hard questions, with most of them medium.
+- Match the student level: {level}.
+- The explanation is 1 or 2 sentences and says why the correct option is right.
+- Apply the feedback below when it is not "None".
+- Make all four options similar in length and level of detail. The correct option must not be the longest or the most detailed one.
+- Keep options short. If a question is about code, put the code snippet in the question text and keep the options as short statements.
+- """ + _LANGUAGE_RULE + """
+"""),
+    ("human", """\
+Topic: {topic}
+Outline:
+{outline}
+
+Feedback on the previous draft: {feedback}
+"""),
+])
+
+===== pyproject.toml =====
+
+[project]
+name = "lecturer-agentic-assistant"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Maryam Sayed", email = "maryamsayed207@gmail.com" }
+]
+
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.142.2",
+    "langchain>=1.4.3",
+    "langchain-google-genai>=4.4.0",
+    "langchain-groq>=1.1.3",
+    "langchain-mcp-adapters>=0.3.2",
+    "langchain-ollama>=1.1.0",
+    "langchain-xai>=1.3.0",
+    "langgraph>=1.2.12",
+    "langgraph-checkpoint-postgres>=3.1.2",
+    "langsmith>=0.14.4",
+    "mcp>=1.30.0,<2",
+    "psycopg[binary,pool]>=3.3.6",
+    "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.2.4",
+    "python-pptx>=1.0.2",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+lecturer-agentic-assistant = "lecturer_agentic_assistant:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+===== run_graph.py =====
+
+"""Phase 5 checkpoint: run the whole graph from a script.   uv run python run_graph.py"""
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from graph import build_graph  # noqa: E402
+
+if __name__ == "__main__":
+    graph = build_graph()
+
+    # Print the diagram (paste it at https://mermaid.live to see it).
+    print(graph.get_graph().draw_mermaid())
+
+    initial_state = {
+        "brief": {
+            "session_id": "test-1",
+            "lecturer_id": "dr-sara",
+            "topic": "Python decorators",
+            "course_name": "Advanced Python",
+            "student_level": "intermediate",
+            "duration_minutes": 60,
+            "language": "English",
+            "programming_language": "Python",
+            "needs": ["slides", "code", "quiz"],
+            "num_quiz_questions": 3,
+            "learning_objectives": ["Students can write their own decorators."],
+            "notes": "Keep slides short.",
+        },
+        "memory_context": [],
+        "feedback": "",
+        "revision_count": 0,
+        "approval_status": "pending",
+        "messages": [],
+    }
+
+    config = {"configurable": {"thread_id": "test-1"}}
+
+    # stream_mode="updates" shows which node ran and what it wrote.
+    for update in graph.stream(initial_state, config, stream_mode="updates"):
+        for node, changes in update.items():
+            print(f"[{node}] wrote: {list(changes.keys())}")
+
+    final = graph.get_state(config).values
+    print("\nselected_agents:", final["selected_agents"])
+    print("outline:", final["outline"])
+    print("slides:", len(final["slides"]), "| code:", len(final["code_examples"]), "| quiz:", len(final["quiz"]))
+
+===== schemas.py =====
+
+"""
+Pydantic models = the shape of the output we ask the LLM to produce.
+
+Why Pydantic and not TypedDict?
+- with_structured_output(Model) sends the schema (field names + descriptions) to the model.
+- After the reply, Pydantic validates it. If the model returns something wrong, an error is
+  raised here instead of the bad data flowing on through the graph.
+
+Every Field(description=...) is sent to the model, so write it as if you were explaining
+to the model what the field should contain.
+
+Note: RoutingDecision (the orchestrator's decision) is created in Phase 4 inside
+graph_nodes/orchestrator.py. It needs AgentName from Session_State.py, and putting it here
+would cause a circular import.
+"""
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+# ---------------------------------------------------------------- research
+class OutlineOutput(BaseModel):
+    sections: list[str] = Field(
+        description="Ordered section titles of the session, from the first to the last."
+    )
+
+
+# ------------------------------------------------------------------ slides
+class Slide(BaseModel):
+    title: str = Field(description="Short slide title.")
+    bullets: list[str] = Field(
+        description="3 to 5 short bullet points. Each bullet is at most 12 words."
+    )
+    notes: str = Field(
+        description="Speaker notes: 2 to 4 sentences the lecturer can say while showing this slide."
+    )
+
+
+class SlidesOutput(BaseModel):
+    slides: list[Slide]
+
+
+# -------------------------------------------------------------------- code
+class CodeExample(BaseModel):
+    title: str = Field(description="What this example demonstrates.")
+    code: str = Field(
+        description="Complete, runnable code. Self-contained: no input(), no files, no network."
+    )
+    explanation: str = Field(
+        description=(
+            "Plain text, no markdown and no code fences. "
+            "At most 5 short sentences: what the code does, then what it prints."
+        )
+    )
+
+
+class CodeOutput(BaseModel):
+    examples: list[CodeExample]
+
+
+# -------------------------------------------------------------------- quiz
+class QuizQuestion(BaseModel):
+    question: str
+    options: list[str] = Field(description="Exactly 4 answer options.")
+    answer_index: int = Field(description="0-based index of the single correct option.")
+    explanation: str = Field(description="1 to 2 sentences explaining why the answer is correct.")
+
+    @field_validator("options")
+    @classmethod
+    def must_have_four_options(cls, v: list[str]) -> list[str]:
+        if len(v) != 4:
+            raise ValueError("options must contain exactly 4 items")
+        return v
+
+    @model_validator(mode="after")
+    def answer_in_range(self):
+        if not 0 <= self.answer_index < len(self.options):
+            raise ValueError("answer_index must point to one of the options")
+        return self
+
+
+class QuizOutput(BaseModel):
+    # Wrapper around the list: some providers do not accept a list as the schema root.
+    questions: list[QuizQuestion]
+
+===== Session_State.py =====
+
+from operator import add
+from typing import Annotated, Literal, TypedDict
+
+
+class SessionBrief(TypedDict):
+    session_id: str
+    lecturer_id: str
+    topic: str
+    course_name: str
+    student_level: str
+    duration_minutes: int
+    language: str
+    programming_language: str
+    needs: list[str]
+    num_quiz_questions: int
+    learning_objectives: list[str]
+    notes: str
+
+
+class SessionState(TypedDict):
+    # 1) Input
+    brief: SessionBrief
+
+    # 2) Orchestrator
+    selected_agents: list[str]
+    reasoning: str
+    memory_context: list[str]
+
+    # 3) Agents (each agent stores plain dicts, via model_dump())
+    outline: list[str]
+    slides: list[dict]
+    code_examples: list[dict]
+    quiz: list[dict]
+
+    # 4) Draft + revision
+    draft: dict
+    approval_status: Literal["pending", "approved", "revise"]
+    feedback: str
+    revision_count: int
+
+    # 5) Final output
+    final_output: dict
+    messages: Annotated[list[str], add]
+
+
+AgentName = Literal["research_agent", "slides_agent", "code_agent", "quiz_agent"]
+AGENT_ORDER: list[AgentName] = ["research_agent", "slides_agent", "code_agent", "quiz_agent"]
+
+
+def next_agent(state, current: str) -> str:
+    """Return the next selected agent after `current`, or 'draft_agent' if none is left."""
+    selected = state["selected_agents"]
+
+    # If current is not one of the 4 agents (e.g. "orchestrator"), start from the beginning.
+    start = AGENT_ORDER.index(current) + 1 if current in AGENT_ORDER else 0
+
+    for name in AGENT_ORDER[start:]:
+        if name in selected:
+            return name
+    return "draft_agent"
+
+
+if __name__ == "__main__":
+    s = {"selected_agents": ["research_agent", "quiz_agent"]}
+    assert next_agent(s, "orchestrator") == "research_agent"
+    assert next_agent(s, "research_agent") == "quiz_agent"   # slides + code skipped
+    assert next_agent(s, "quiz_agent") == "draft_agent"
+    print("next_agent: OK")
+
+===== test_code_runner.py =====
+
+"""
+Phase 6 checkpoint (part 1): test the code_runner MCP server on its own.
+
+    uv run python test_code_runner.py
+
+Step A calls the function directly (fast, easy to debug).
+Step B starts the server as a separate process and calls it through the real MCP protocol,
+which is exactly what the code_agent will do later.
+"""
+
+import asyncio
+import json
+import os
+import sys
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+from MCP_Servers.code_runner_server import run_python
+
+CASES = {
+    "prints":        ("print('hello')",                                   lambda r: r["ok"] and "hello" in r["stdout"]),
+    "syntax error":  ("def f(:\n    pass",                                lambda r: not r["ok"] and "SyntaxError" in r["stderr"]),
+    "runtime error": ("print(1/0)",                                       lambda r: not r["ok"] and "ZeroDivisionError" in r["stderr"]),
+    "infinite loop": ("while True:\n    pass",                           lambda r: r["timed_out"]),
+    "no secrets":    ("import os\nprint(os.environ.get('GROQ_API_KEY'))", lambda r: r["ok"] and "None" in r["stdout"]),
+    "input() fails fast": ("input('name? ')",                             lambda r: not r["ok"] and "EOFError" in r["stderr"]),
+    "long output":   ("print('x' * 100000)",                              lambda r: r["ok"] and "truncated" in r["stdout"]),
+}
+
+
+def check(label: str, result: dict, test) -> None:
+    status = "OK  " if test(result) else "FAIL"
+    print(f"  [{status}] {label}")
+    if status == "FAIL":
+        print("         got:", {k: (v[:80] if isinstance(v, str) else v) for k, v in result.items()})
+
+
+def step_a_direct() -> None:
+    print("== A) direct call ==")
+    os.environ["GROQ_API_KEY"] = "secret-test-key"  # must NOT reach the child process
+    for label, (code, test) in CASES.items():
+        check(label, json.loads(run_python(code)), test)
+
+
+async def step_b_mcp() -> None:
+    print("== B) through MCP (stdio) ==")
+    params = StdioServerParameters(command=sys.executable, args=["MCP_Servers/code_runner_server.py"])
+
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            tools = await session.list_tools()
+            print("  tools:", [t.name for t in tools.tools])
+
+            for label, (code, test) in CASES.items():
+                reply = await session.call_tool("run_python", {"code": code})
+                check(label, json.loads(reply.content[0].text), test)
+
+if __name__ == "__main__":
+    step_a_direct()
+    asyncio.run(step_b_mcp())
+
+===== test_llm.py =====
+
+"""
+Phase 2 checkpoint.
+
+Run:
+    uv run python test_llm.py              # every provider configured in .env
+    uv run python test_llm.py groq         # one provider
+    uv run python test_llm.py groq gemini  # two providers
+
+Steps:
+  0) Check that every prompt builds and has the expected variables (no LLM call)
+  1) Plain text
+  2) Simple structured output
+  3) QUIZ_PROMPT | llm.with_structured_output(QuizOutput)
+"""
+
+import sys
+
+from pydantic import BaseModel, Field
+
+import prompts
+from llm.llm_provider import PROVIDERS, _missing, get_llm
+from schemas import QuizOutput
+
+
+class Capital(BaseModel):
+    country: str
+    capital: str = Field(description="Capital city name")
+
+
+def check_prompts() -> None:
+    print("== Step 0: prompt variables ==")
+    for name in ["ORCHESTRATOR_PROMPT", "RESEARCH_PROMPT", "SLIDES_PROMPT", "CODE_PROMPT", "QUIZ_PROMPT"]:
+        p = getattr(prompts, name)
+        print(f"{name:20} -> {sorted(p.input_variables)}")
+    print()
+
+
+def test_provider(provider: str) -> None:
+    print(f"== {provider} ==")
+    llm = get_llm(provider=provider)
+
+    # 1) text
+    print("1) text:", llm.invoke("Say hi in one short sentence.").content)
+
+    # 2) simple structured output
+    print("2) structured:", llm.with_structured_output(Capital).invoke("What is the capital of Egypt?"))
+
+    # 3) quiz chain
+    chain = prompts.QUIZ_PROMPT | llm.with_structured_output(QuizOutput)
+    result = chain.invoke({
+        "topic": "Python decorators",
+        "outline": "- Functions are objects\n- Closures\n- Writing a decorator",
+        "level": "intermediate",
+        "num_questions": 3,
+        "language": "English",
+        "feedback": "None",
+    })
+
+    assert len(result.questions) == 3, f"expected 3 questions, got {len(result.questions)}"
+    for i, q in enumerate(result.questions, 1):
+        print(f"   Q{i}: {q.question}")
+        for j, opt in enumerate(q.options):
+            print(f"      {'*' if j == q.answer_index else ' '} {opt}")
+    print("3) quiz: OK\n")
+
+
+if __name__ == "__main__":
+    check_prompts()
+
+    requested = sys.argv[1:] or [p for p in PROVIDERS if not _missing(p)]
+    if not requested:
+        sys.exit("No provider is configured. Fill the key and model name in .env.")
+
+    for provider in requested:
+        try:
+            test_provider(provider)
+        except Exception as e:  # keep going with the other providers if one fails
+            print(f"[{provider}] FAILED: {type(e).__name__}: {e}\n")

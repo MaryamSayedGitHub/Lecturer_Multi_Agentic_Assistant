@@ -1,5 +1,6 @@
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.store.memory import InMemoryStore
 
 from graph_nodes.code_agent import code_agent
 from graph_nodes.draft_agent import draft_agent
@@ -52,5 +53,8 @@ def build_graph(checkpointer=None, store=None):
     )
     builder.add_edge("final_agent", END)
 
-    # 3) compile
-    return builder.compile(checkpointer=checkpointer or InMemorySaver(), store=store)
+    # 3) compile (defaults keep scripts and tests working without a database)
+    return builder.compile(
+        checkpointer=checkpointer or InMemorySaver(),
+        store=store if store is not None else InMemoryStore(),
+    )

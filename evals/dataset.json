@@ -1,1 +1,86 @@
-[]
+[
+  {
+    "lecturer_id": "eval",
+    "course_name": "",
+    "language": "English",
+    "programming_language": "Python",
+    "needs": [
+      "slides",
+      "code",
+      "quiz"
+    ],
+    "learning_objectives": [],
+    "notes": "",
+    "topic": "Python decorators",
+    "student_level": "intermediate",
+    "duration_minutes": 60,
+    "num_quiz_questions": 5
+  },
+  {
+    "lecturer_id": "eval",
+    "course_name": "",
+    "language": "Arabic",
+    "programming_language": "Python",
+    "needs": [
+      "slides",
+      "code",
+      "quiz"
+    ],
+    "learning_objectives": [],
+    "notes": "",
+    "topic": "Recursion",
+    "student_level": "beginner",
+    "duration_minutes": 45,
+    "num_quiz_questions": 4
+  },
+  {
+    "lecturer_id": "eval",
+    "course_name": "",
+    "language": "English",
+    "programming_language": "Python",
+    "needs": [
+      "slides",
+      "quiz"
+    ],
+    "learning_objectives": [],
+    "notes": "",
+    "topic": "SQL joins",
+    "student_level": "beginner",
+    "duration_minutes": 30,
+    "num_quiz_questions": 3
+  },
+  {
+    "lecturer_id": "eval",
+    "course_name": "",
+    "language": "English",
+    "programming_language": "Python",
+    "needs": [
+      "slides",
+      "code",
+      "quiz"
+    ],
+    "learning_objectives": [],
+    "notes": "",
+    "topic": "Binary search trees",
+    "student_level": "intermediate",
+    "duration_minutes": 90,
+    "num_quiz_questions": 6
+  },
+  {
+    "lecturer_id": "eval",
+    "course_name": "",
+    "language": "English",
+    "programming_language": "Python",
+    "needs": [
+      "slides",
+      "code",
+      "quiz"
+    ],
+    "learning_objectives": [],
+    "notes": "",
+    "topic": "Gradient descent",
+    "student_level": "advanced",
+    "duration_minutes": 60,
+    "num_quiz_questions": 5
+  }
+]

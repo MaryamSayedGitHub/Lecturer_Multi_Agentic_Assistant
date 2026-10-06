@@ -1,7 +1,11 @@
+import logging
+
 from graph_nodes.utils import build_chain, format_optional
 from MCP_Servers.mcp_client import web_search
 from prompts import RESEARCH_PROMPT
 from schemas import OutlineOutput
+
+log = logging.getLogger(__name__)
 
 NO_SEARCH = "(web search was not available, use well-established knowledge)"
 MAX_SEARCH_CHARS = 6000  # keep the prompt small: search results can be very long
@@ -17,15 +21,15 @@ def _search(brief: dict) -> str:
     try:
         text = web_search(query, max_results=5)
     except Exception as e:  # the message is already cleaned (no API key) by mcp_client
-        print(f"[research_agent] web search failed, continuing without it: {str(e)[:300]}")
+        log.warning("web search failed, continuing without it: %s", str(e)[:300])
         return NO_SEARCH
 
     text = text.strip()
     if not text:
-        print("[research_agent] web search returned nothing")
+        log.warning("web search returned nothing")
         return NO_SEARCH
 
-    print(f"[research_agent] web search OK ({len(text)} characters)")
+    log.info("web search OK (%d characters)", len(text))
     return text[:MAX_SEARCH_CHARS]
 
 

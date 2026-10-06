@@ -35,7 +35,8 @@ class SessionState(TypedDict):
     # 4) Draft + revision
     draft: dict
     approval_status: Literal["pending", "approved", "revise"]
-    feedback: str
+    feedback: str                                   # the latest change request
+    feedback_history: Annotated[list[str], add]     # every change request of this session
     revision_count: int
 
     # 5) Final output

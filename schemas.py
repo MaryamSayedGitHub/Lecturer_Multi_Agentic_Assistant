@@ -14,6 +14,8 @@ graph_nodes/orchestrator.py. It needs AgentName from Session_State.py, and putti
 would cause a circular import.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -32,6 +34,14 @@ class Slide(BaseModel):
     )
     notes: str = Field(
         description="Speaker notes: 2 to 4 sentences the lecturer can say while showing this slide."
+    )
+    diagram_steps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional small flow diagram drawn next to the bullets: 3 to 5 steps in order, "
+            "each at most 5 words. Use it only when the slide explains a process, a sequence "
+            "or a cause-and-effect chain. Otherwise leave it empty."
+        ),
     )
 
 
@@ -81,3 +91,40 @@ class QuizQuestion(BaseModel):
 class QuizOutput(BaseModel):
     # Wrapper around the list: some providers do not accept a list as the schema root.
     questions: list[QuizQuestion]
+
+# ===================================================================== API
+# The shapes below are what the browser sends to FastAPI (not what the LLM returns).
+
+
+class SessionRequest(BaseModel):
+    lecturer_id: str = Field(min_length=1, max_length=80)
+    topic: str = Field(min_length=2, max_length=200)
+    course_name: str = Field(default="", max_length=200)
+    student_level: Literal["beginner", "intermediate", "advanced"] = "intermediate"
+    duration_minutes: int = Field(default=60, ge=15, le=240)
+    language: str = Field(default="English", max_length=40)
+    programming_language: str = Field(default="Python", max_length=40)
+    needs: list[Literal["slides", "code", "quiz"]] = Field(min_length=1)
+    num_quiz_questions: int = Field(default=5, ge=1, le=20)
+    learning_objectives: list[str] = Field(default_factory=list)
+    notes: str = Field(default="", max_length=2000)
+
+    @field_validator("learning_objectives", mode="before")
+    @classmethod
+    def objectives_as_list(cls, v):
+        """The form sends one text box. Accept text (one objective per line) or a list."""
+        if isinstance(v, str):
+            v = v.splitlines()
+        return [line.strip(" -\t") for line in (v or []) if line and line.strip(" -\t")]
+
+
+class ApproveRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=64)
+    decision: Literal["approve", "revise"]
+    feedback: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def revise_needs_feedback(self):
+        if self.decision == "revise" and not self.feedback.strip():
+            raise ValueError("feedback is required when requesting changes")
+        return self
